@@ -6,17 +6,17 @@ import threading
 import lark_oapi as lark
 from dotenv import load_dotenv
 
-from .config import ConfigError, Settings
-from .events import register_handlers
-from .feishu import FeishuGateway
-from .service import DemandAgent
+from agents.speaker_agent.config import ConfigError, Settings
+from agents.speaker_agent.adapters.feishu.events import register_handlers
+from agents.speaker_agent.adapters.feishu.gateway import FeishuGateway
+from agents.speaker_agent.orchestration.service import DemandAgent
 
 
 LOGGER = logging.getLogger(__name__)
 
 
 def main() -> None:
-    load_dotenv()
+    load_dotenv(encoding="utf-8-sig")
     try:
         settings = Settings.from_env()
         settings.validate_for_startup()
@@ -28,6 +28,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     settings.runtime_dir.mkdir(parents=True, exist_ok=True)
+    if settings.enable_chat_commands and not settings.bot_open_id:
+        LOGGER.warning("FEISHU_BOT_OPEN_ID 未设置：仅接收私聊，群聊不会触发建档")
 
     gateway = FeishuGateway(settings)
     agent = DemandAgent(settings, gateway)

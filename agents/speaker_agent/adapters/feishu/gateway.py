@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, TypeVar
 
 import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import (
@@ -34,12 +34,21 @@ from lark_oapi.api.im.v1 import (
     ReplyMessageRequestBody,
 )
 
-from .config import Settings
-from .models import DemandRecord
+from agents.speaker_agent.config import Settings
+from agents.speaker_agent.domain.models import DemandRecord
 
 
 class FeishuApiError(RuntimeError):
     """Raised when a Feishu OpenAPI call fails."""
+
+
+ServiceT = TypeVar("ServiceT")
+
+
+def _require_service(service: ServiceT | None) -> ServiceT:
+    if service is None:
+        raise FeishuApiError("Feishu SDK service is not initialized; build the client before use")
+    return service
 
 
 class FeishuGateway:
@@ -63,7 +72,7 @@ class FeishuGateway:
             .user_id_type("open_id")
             .build()
         )
-        response = self.client.bitable.v1.app_table_record.get(request)
+        response = _require_service(self.client.bitable).v1.app_table_record.get(request)
         record = _required_data(response, "read Bitable record").record
         if record is None:
             raise FeishuApiError(f"Bitable record {record_id} has no data")
@@ -87,7 +96,7 @@ class FeishuGateway:
             )
             if page_token:
                 builder.page_token(page_token)
-            response = self.client.bitable.v1.app_table_record.list(builder.build())
+            response = _require_service(self.client.bitable).v1.app_table_record.list(builder.build())
             data = _required_data(response, "list Bitable records")
             records.extend(self._to_demand(item) for item in data.items or [])
             if not data.has_more or not data.page_token:
@@ -102,14 +111,25 @@ class FeishuGateway:
         proposal_url: str = "",
         error: str = "",
     ) -> None:
-        fields: dict[str, Any] = {self.settings.status_field: status}
+        fields: dict[str, Any] = {self.settings.status_field: status, self.settings.error_field: error[:1000]}
         if proposal_url:
             fields[self.settings.proposal_field] = {
-                "text": "\u67e5\u770b\u65b9\u6848",
+                "text": "查看方案",
                 "link": proposal_url,
             }
-        if error:
-            fields[self.settings.error_field] = error[:1000]
+        self._update_fields(record_id, fields)
+
+    def write_result(self, record_id: str, markdown: str, *, document_url: str = "") -> None:
+        fields: dict[str, Any] = {
+            self.settings.status_field: self.settings.completed_status,
+            self.settings.result_field: markdown,
+            self.settings.error_field: "",
+        }
+        if document_url:
+            fields[self.settings.proposal_field] = {"text": "查看结论", "link": document_url}
+        self._update_fields(record_id, fields)
+
+    def _update_fields(self, record_id: str, fields: dict[str, Any]) -> None:
         body = AppTableRecord.builder().fields(fields).build()
         request = (
             UpdateAppTableRecordRequest.builder()
@@ -120,20 +140,21 @@ class FeishuGateway:
             .request_body(body)
             .build()
         )
-        response = self.client.bitable.v1.app_table_record.update(request)
+        response = _require_service(self.client.bitable).v1.app_table_record.update(request)
         _required_data(response, "update Bitable record")
 
-    def create_record(self, fields: dict[str, Any]) -> str:
+    def create_record(self, fields: dict[str, Any], *, client_token: str = "") -> str:
         body = AppTableRecord.builder().fields(fields).build()
         request = (
             CreateAppTableRecordRequest.builder()
             .app_token(self.settings.bitable_app_token)
             .table_id(self.settings.bitable_table_id)
             .user_id_type("open_id")
+            .client_token(client_token)
             .request_body(body)
             .build()
         )
-        response = self.client.bitable.v1.app_table_record.create(request)
+        response = _require_service(self.client.bitable).v1.app_table_record.create(request)
         record = _required_data(response, "create Bitable record").record
         if record is None or not record.record_id:
             raise FeishuApiError("Feishu record creation returned no record ID")
@@ -146,13 +167,15 @@ class FeishuGateway:
         create_request = (
             CreateDocumentRequest.builder().request_body(body_builder.build()).build()
         )
-        create_response = self.client.docx.v1.document.create(create_request)
+        create_response = _require_service(self.client.docx).v1.document.create(create_request)
         document = _required_data(create_response, "create Feishu document").document
         if document is None or not document.document_id:
             raise FeishuApiError("Feishu document creation returned no document ID")
         document_id = document.document_id
 
         converted = self._convert_markdown(markdown)
+        if converted is None:
+            raise FeishuApiError("Feishu Markdown conversion returned no content")
         if converted:
             children_id, descendants = converted
             descendant_body = (
@@ -170,7 +193,7 @@ class FeishuGateway:
                 .request_body(descendant_body)
                 .build()
             )
-            descendant_response = self.client.docx.v1.document_block_descendant.create(
+            descendant_response = _require_service(self.client.docx).v1.document_block_descendant.create(
                 descendant_request
             )
             _required_data(descendant_response, "write Feishu document")
@@ -198,15 +221,16 @@ class FeishuGateway:
             .request_body(member)
             .build()
         )
-        response = self.client.drive.v1.permission_member.create(request)
+        response = _require_service(self.client.drive).v1.permission_member.create(request)
         _required_data(response, "grant document permission")
 
-    def send_text(self, receive_id_type: str, receive_id: str, text: str) -> None:
+    def send_text(self, receive_id_type: str, receive_id: str, text: str, *, uuid: str = "") -> None:
         body = (
             CreateMessageRequestBody.builder()
             .receive_id(receive_id)
             .msg_type("text")
             .content(json.dumps({"text": text}, ensure_ascii=False))
+            .uuid(uuid)
             .build()
         )
         request = (
@@ -215,20 +239,21 @@ class FeishuGateway:
             .request_body(body)
             .build()
         )
-        response = self.client.im.v1.message.create(request)
+        response = _require_service(self.client.im).v1.message.create(request)
         _required_data(response, "send Feishu message")
 
-    def reply_text(self, message_id: str, text: str) -> None:
+    def reply_text(self, message_id: str, text: str, *, uuid: str = "") -> None:
         body = (
             ReplyMessageRequestBody.builder()
             .msg_type("text")
             .content(json.dumps({"text": text}, ensure_ascii=False))
+            .uuid(uuid)
             .build()
         )
         request = (
             ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
         )
-        response = self.client.im.v1.message.reply(request)
+        response = _require_service(self.client.im).v1.message.reply(request)
         _required_data(response, "reply to Feishu message")
 
     def record_url(self, record_id: str) -> str:
@@ -253,7 +278,7 @@ class FeishuGateway:
         return DemandRecord(
             record_id=record_id,
             fields=fields,
-            title=self._field_text(fields, self.settings.title_field) or "\u672a\u547d\u540d\u9700\u6c42",
+            title=self._field_text(fields, self.settings.title_field) or "未命名需求",
             requester_id=self._person_id(fields.get(self.settings.requester_field)),
             status=self._field_text(fields, self.settings.status_field),
             record_url=str(getattr(record, "record_url", "") or "") or self.record_url(record_id),
@@ -273,7 +298,7 @@ class FeishuGateway:
             )
             if page_token:
                 builder.page_token(page_token)
-            response = self.client.bitable.v1.app_table_field.list(builder.build())
+            response = _require_service(self.client.bitable).v1.app_table_field.list(builder.build())
             data = _required_data(response, "list Bitable fields")
             for item in data.items or []:
                 if item.field_id and item.field_name:
@@ -297,7 +322,7 @@ class FeishuGateway:
             .build()
         )
         request = ConvertDocumentRequest.builder().request_body(body).build()
-        response = self.client.docx.v1.document.convert(request)
+        response = _require_service(self.client.docx).v1.document.convert(request)
         data = _required_data(response, "convert proposal Markdown")
         first_level = [
             str(block_id)
@@ -350,7 +375,7 @@ def _plain_text(value: Any) -> str:
         return str(value)
     if isinstance(value, list):
         parts = [_plain_text(item) for item in value]
-        return "\u3001".join(part for part in parts if part)
+        return "、".join(part for part in parts if part)
     if isinstance(value, Mapping):
         for key in ("text", "name", "value", "link", "url"):
             if key in value:
@@ -358,7 +383,7 @@ def _plain_text(value: Any) -> str:
                 if text:
                     return text
         parts = [_plain_text(item) for item in value.values()]
-        return "\u3001".join(part for part in parts if part)
+        return "、".join(part for part in parts if part)
     return _compact(str(value))
 
 

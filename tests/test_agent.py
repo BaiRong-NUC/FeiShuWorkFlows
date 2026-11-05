@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+from helpers import required, as_message_event, as_record_event
+
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from speaker_agent.config import Settings
-from speaker_agent.contracts import AnalysisResult, DownstreamResult, ReviewResult
-from speaker_agent.events import on_message, on_record_changed
-from speaker_agent.models import DemandRecord, IncomingDemand
-from speaker_agent.service import DemandAgent
-from speaker_agent.state import ProcessedEventStore
+from agents.speaker_agent.config import Settings
+from agents.speaker_agent.domain.contracts import AnalysisResult, DownstreamResult, ReviewResult
+from agents.speaker_agent.adapters.feishu.events import on_message, on_record_changed
+from agents.speaker_agent.domain.models import DemandRecord, IncomingDemand
+from agents.speaker_agent.orchestration.service import DemandAgent
+from agents.speaker_agent.persistence.state import ProcessedEventStore
 
 
 class FakeGateway:
@@ -23,6 +26,8 @@ class FakeGateway:
         self.messages: list[tuple[str, str, str]] = []
         self.replies: list[tuple[str, str]] = []
         self.created: list[dict] = []
+        self.results: list[tuple[str, str]] = []
+        self.client_tokens: list[str] = []
 
     def get_record(self, record_id: str) -> DemandRecord:
         if record_id not in {self.record.record_id, "rec1", "rec-created"}:
@@ -31,13 +36,22 @@ class FakeGateway:
 
     def update_status(self, record_id: str, status: str, *, proposal_url: str = "", error: str = "") -> None:
         self.statuses.append((record_id, status, proposal_url or error))
+        self.record = replace(self.record, status=status)
+
+    def list_records_by_status(self, status: str) -> list[DemandRecord]:
+        return [self.record] if self.record.status == status else []
+
+    def write_result(self, record_id: str, markdown: str, *, document_url: str = "") -> None:
+        self.results.append((record_id, markdown))
+        self.update_status(record_id, "已生成", proposal_url=document_url)
 
     def create_proposal_document(self, title: str, markdown: str) -> tuple[str, str]:
         self.documents.append((title, markdown))
         return "docx-token", "https://example.feishu.cn/docx/docx-token"
 
-    def create_record(self, fields: dict) -> str:
+    def create_record(self, fields: dict, *, client_token: str = "") -> str:
         self.created.append(fields)
+        self.client_tokens.append(client_token)
         self.record = DemandRecord(
             record_id="rec-created",
             fields=fields,
@@ -51,10 +65,10 @@ class FakeGateway:
     def grant_document_view(self, document_token: str, open_id: str) -> None:
         self.permissions.append((document_token, open_id))
 
-    def send_text(self, receive_id_type: str, receive_id: str, text: str) -> None:
+    def send_text(self, receive_id_type: str, receive_id: str, text: str, *, uuid: str = "") -> None:
         self.messages.append((receive_id_type, receive_id, text))
 
-    def reply_text(self, message_id: str, text: str) -> None:
+    def reply_text(self, message_id: str, text: str, *, uuid: str = "") -> None:
         self.replies.append((message_id, text))
 
 
@@ -81,6 +95,8 @@ def settings(runtime_dir: Path) -> Settings:
         enable_polling=True,
         enable_chat_commands=True,
         log_level="INFO",
+        bot_open_id="ou_bot",
+        status_field_id="fld_status",
     )
 
 
@@ -105,7 +121,7 @@ class AgentTests(unittest.TestCase):
                 store=ProcessedEventStore(Path(directory) / "events.json"),
             )
             agent.enqueue_record("rec1", revision=7)
-            result = agent.process_item(agent._next_item())
+            result = required(agent.process_item(required(agent._next_item())))
 
         self.assertTrue(result.ok)
         self.assertEqual(gateway.statuses[-1][1], "已生成")
@@ -123,7 +139,7 @@ class AgentTests(unittest.TestCase):
                 store=ProcessedEventStore(Path(directory) / "events.json"),
             )
             agent.enqueue_record("rec1")
-            result = agent.process_item(agent._next_item())
+            result = required(agent.process_item(required(agent._next_item())))
 
         self.assertTrue(result.ok)
         self.assertEqual(result.document_url, "")
@@ -145,7 +161,7 @@ class AgentTests(unittest.TestCase):
                 message_id="om_demand",
             )
             self.assertTrue(agent.accept_message(demand))
-            result = agent.process_item(agent._next_item())
+            result = required(agent.process_item(required(agent._next_item())))
 
         self.assertEqual(result.record_id, "rec-created")
         self.assertEqual(gateway.created[0]["需求标题"], "导出报表")
@@ -160,11 +176,12 @@ class AgentTests(unittest.TestCase):
             )
             changed = _record_event("rec2", before="草稿", after="待生成方案")
             unchanged = _record_event("rec1", before="待生成方案", after="待生成方案")
-            on_record_changed(agent, changed)
-            on_record_changed(agent, unchanged)
+            on_record_changed(agent, as_record_event(changed))
+            on_record_changed(agent, as_record_event(unchanged))
 
-            queued = agent._next_item()
+            queued = required(agent._next_item())
             self.assertEqual(queued.record_id, "rec2")
+            agent.workflows.finish_work(queued.key)
             self.assertIsNone(agent._next_item())
 
     def test_chat_command_replies_and_queues(self) -> None:
@@ -175,7 +192,7 @@ class AgentTests(unittest.TestCase):
                 gateway,
                 store=ProcessedEventStore(Path(directory) / "events.json"),
             )
-            content = json.dumps({"text": "@_user_1 生成方案 https://example.feishu.cn/base/x?record=rec1"})
+            content = json.dumps({"text": "@_user_1 生成方案 https://example.feishu.cn/base/base-token?record=rec1"})
             mention = SimpleNamespace(key="@_user_1", id=SimpleNamespace(open_id="ou_bot"))
             message = SimpleNamespace(
                 message_id="om_message",
@@ -184,11 +201,10 @@ class AgentTests(unittest.TestCase):
                 content=content,
                 mentions=[mention],
             )
-            on_message(agent, SimpleNamespace(event=SimpleNamespace(sender=None, message=message)))
-
-        queued = agent._next_item()
-        self.assertEqual(queued.record_id, "rec1")
-        self.assertIn("已接收", gateway.replies[0][1])
+            on_message(agent, as_message_event(SimpleNamespace(event=SimpleNamespace(sender=None, message=message))))
+            queued = required(agent._next_item())
+            self.assertEqual(queued.record_id, "rec1")
+            self.assertIn("已接收", gateway.replies[0][1])
 
 
 def _record() -> DemandRecord:
@@ -208,7 +224,7 @@ def _record() -> DemandRecord:
 
 
 def _record_event(record_id: str, *, before: str, after: str):
-    field = lambda value: SimpleNamespace(field_id="fld_status", field_value=value, field_identity_value="状态")
+    field = lambda value: SimpleNamespace(field_id="fld_status", field_value=json.dumps(value), field_identity_value={})
     action = SimpleNamespace(
         record_id=record_id,
         action="record_edited",

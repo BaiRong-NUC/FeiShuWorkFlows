@@ -1,34 +1,35 @@
 from __future__ import annotations
 
-from .contracts import AnalysisResult, DownstreamResult, RequirementBrief, ReviewResult
+from pathlib import Path
+from string import Template
+
+from agents.speaker_agent.domain.contracts import AnalysisResult, DownstreamResult, RequirementBrief, ReviewResult
 
 
 class ReplyFormatter:
     """Render downstream results in the fixed requester-facing Markdown format."""
 
+    def __init__(self, template_path: Path | None = None) -> None:
+        path = template_path or Path(__file__).resolve().parents[1] / "templates" / "reply.md"
+        self.template = Template(path.read_text(encoding="utf-8-sig"))
+        # Fail at startup, before accepting work or writing to Feishu.
+        self.template.substitute({key: "" for key in (
+            "title", "analysis_summary", "recommended_plan", "effort_and_dependencies",
+            "risks_and_questions", "next_actions", "record_url", "request_id",
+        )})
+
     def render(self, brief: RequirementBrief, downstream: DownstreamResult) -> str:
         analysis = downstream.analysis
         review = downstream.review
-        lines = [
-            f"# 需求结论：{brief.title}",
-            "",
-            "## 需求结论",
-            "",
-            _sentence(analysis.summary if analysis else "下层需求分析尚未返回结论。"),
-            "",
-            "## 建议方案",
-            "",
-            _sentence(review.recommended_plan if review else "下层技术评审尚未返回方案。"),
-            "",
-            "## 工作量与依赖",
-            "",
-        ]
-        lines.extend(_facts(review))
-        lines.extend(["", "## 风险与待确认", ""])
-        lines.extend(_risks(brief, analysis, review))
-        lines.extend(["", "## 下一步", ""])
-        lines.extend(_next_actions(analysis, review))
-        return "\n".join(lines).strip() + "\n"
+        return self.template.substitute(
+            title=_sentence(brief.title),
+            analysis_summary=_sentence(analysis.summary if analysis else "需求分析待返回"),
+            recommended_plan=_sentence(review.recommended_plan if review else "技术方案待返回"),
+            effort_and_dependencies="\n".join(_facts(review)),
+            risks_and_questions="\n".join(_risks(brief, analysis, review)),
+            next_actions="\n".join(_next_actions(analysis, review)),
+            record_url=brief.record_url or "未提供", request_id=brief.request_id,
+        ).strip() + "\n"
 
     def pending(self, brief: RequirementBrief) -> str:
         lines = [
@@ -46,7 +47,7 @@ def _facts(review: ReviewResult | None) -> list[str]:
     if review is None:
         return ["- 工作量：待技术评审", "- 依赖：待技术评审"]
     effort = review.estimated_effort or "待评估"
-    dependencies = "、".join(review.dependencies) or "无额外依赖"
+    dependencies = "、".join(review.dependencies) or "未提供，待确认"
     return [
         f"- 评审结论：{review.conclusion}",
         f"- 工作量：{effort}",
@@ -59,14 +60,14 @@ def _risks(
     analysis: AnalysisResult | None,
     review: ReviewResult | None,
 ) -> list[str]:
-    items = list(brief.missing_fields)
+    items = [f"待补充：{name}" for name in brief.missing_fields]
     if analysis is not None:
         items.extend(analysis.risks)
         items.extend(analysis.open_questions)
     if review is not None:
         items.extend(review.risks)
     if not items:
-        return ["- 暂无额外风险。"]
+        return ["- 下层未提供风险项，待确认。"]
     return [f"- {item}" for item in _unique(items)]
 
 
@@ -77,7 +78,7 @@ def _next_actions(analysis: AnalysisResult | None, review: ReviewResult | None) 
     if analysis is not None:
         actions.extend(analysis.open_questions)
     if not actions:
-        actions.append("等待下层分析与评审结果。")
+        actions.append("请需求人确认上述结论。" if analysis and review else "等待下层分析与评审结果。")
     return [f"{index}. {action}" for index, action in enumerate(_unique(actions), start=1)]
 
 

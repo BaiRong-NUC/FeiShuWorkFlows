@@ -43,6 +43,12 @@ class Settings:
     enable_polling: bool
     enable_chat_commands: bool
     log_level: str
+    bot_open_id: str = ""
+    result_field: str = "处理结论"
+    raw_field: str = "需求原文"
+    reply_template: Path | None = None
+    create_documents: bool = False
+    status_field_id: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -76,24 +82,29 @@ class Settings:
             bitable_url=_value("FEISHU_BITABLE_URL"),
             notify_chat_id=_value("FEISHU_NOTIFY_CHAT_ID"),
             doc_folder_token=_value("FEISHU_DOC_FOLDER_TOKEN"),
-            trigger_status=_value("FEISHU_TRIGGER_STATUS", "\u5f85\u751f\u6210\u65b9\u6848"),
-            processing_status=_value("FEISHU_PROCESSING_STATUS", "\u751f\u6210\u4e2d"),
-            completed_status=_value("FEISHU_COMPLETED_STATUS", "\u5df2\u751f\u6210"),
-            failed_status=_value("FEISHU_FAILED_STATUS", "\u751f\u6210\u5931\u8d25"),
-            status_field=_value("FEISHU_STATUS_FIELD", "\u72b6\u6001"),
-            title_field=_value("FEISHU_TITLE_FIELD", "\u9700\u6c42\u6807\u9898"),
-            requester_field=_value("FEISHU_REQUESTER_FIELD", "\u63d0\u51fa\u4eba"),
-            proposal_field=_value("FEISHU_PROPOSAL_FIELD", "\u65b9\u6848\u94fe\u63a5"),
-            error_field=_value("FEISHU_ERROR_FIELD", "\u5904\u7406\u5907\u6ce8"),
+            trigger_status=_value("FEISHU_TRIGGER_STATUS", "待生成方案"),
+            processing_status=_value("FEISHU_PROCESSING_STATUS", "生成中"),
+            completed_status=_value("FEISHU_COMPLETED_STATUS", "已生成"),
+            failed_status=_value("FEISHU_FAILED_STATUS", "生成失败"),
+            status_field=_value("FEISHU_STATUS_FIELD", "状态"),
+            title_field=_value("FEISHU_TITLE_FIELD", "需求标题"),
+            requester_field=_value("FEISHU_REQUESTER_FIELD", "提出人"),
+            proposal_field=_value("FEISHU_PROPOSAL_FIELD", "方案链接"),
+            error_field=_value("FEISHU_ERROR_FIELD", "处理备注"),
             runtime_dir=runtime_dir,
             poll_seconds=poll_seconds,
             enable_polling=_bool("FEISHU_ENABLE_POLLING", True),
             enable_chat_commands=_bool("FEISHU_ENABLE_CHAT_COMMANDS", True),
             log_level=_value("FEISHU_LOG_LEVEL", "INFO").upper() or "INFO",
+            bot_open_id=_value("FEISHU_BOT_OPEN_ID"),
+            result_field=_value("FEISHU_RESULT_FIELD", "处理结论"),
+            raw_field=_value("FEISHU_RAW_FIELD", "需求原文"),
+            reply_template=Path(_value("SPEAKER_REPLY_TEMPLATE")) if _value("SPEAKER_REPLY_TEMPLATE") else None,
+            create_documents=_bool("FEISHU_CREATE_DOCUMENTS", False),
+            status_field_id=_value("FEISHU_STATUS_FIELD_ID"),
         )
 
     def validate_for_startup(self) -> None:
-        if not self.notify_chat_id:
-            raise ConfigError(
-                "FEISHU_NOTIFY_CHAT_ID is required so generated proposals can be sent back to Feishu"
-            )
+        if not self.result_field or not self.raw_field:
+            raise ConfigError("FEISHU_RESULT_FIELD and FEISHU_RAW_FIELD are required")
+        # A notification group is optional; the originating chat/requester is sufficient.

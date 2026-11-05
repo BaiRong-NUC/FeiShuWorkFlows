@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from collections.abc import Mapping
 from typing import Any
 
-from .config import Settings
-from .contracts import RequirementBrief
-from .models import DemandRecord, IncomingDemand
+from agents.speaker_agent.config import Settings
+from agents.speaker_agent.domain.contracts import RequirementBrief
+from agents.speaker_agent.domain.models import DemandRecord, IncomingDemand
 
 
 DETAIL_FIELDS = (
@@ -30,6 +31,8 @@ class RequirementNormalizer:
 
     def from_record(self, record: DemandRecord, *, source: str = "台账") -> RequirementBrief:
         fields = record.fields
+        raw_text = _text(fields.get(self.settings.raw_field))
+        parsed = self.from_message(IncomingDemand(raw_text, record.requester_id, "")) if raw_text else None
         requirements = _join(
             _text(fields.get("功能要求")),
             _text(fields.get("非功能要求")),
@@ -48,10 +51,14 @@ class RequirementNormalizer:
             due_date=_text(fields.get("期望上线时间")),
             links=_text(fields.get("相关链接")),
             record_url=record.record_url,
+            raw_text=raw_text,
         )
-        return RequirementBrief(
-            **{**brief.__dict__, "missing_fields": _missing(brief)}
-        )
+        if parsed:
+            brief = replace(brief, **{
+                name: getattr(brief, name) or getattr(parsed, name)
+                for name in ("background", "goal", "requirements", "constraints", "acceptance", "priority", "due_date", "links")
+            })
+        return replace(brief, missing_fields=_missing(brief))
 
     def from_message(self, demand: IncomingDemand) -> RequirementBrief:
         sections = _sections(demand.text)
@@ -76,24 +83,19 @@ class RequirementNormalizer:
             due_date=sections.get("期望上线时间", ""),
             links=sections.get("相关链接", ""),
             record_url="",
+            raw_text=demand.text,
+            source_message_id=demand.message_id,
+            source_chat_id=demand.chat_id,
         )
-        return RequirementBrief(
-            **{**brief.__dict__, "missing_fields": _missing(brief)}
-        )
+        return replace(brief, missing_fields=_missing(brief))
 
     def ledger_fields(self, brief: RequirementBrief) -> dict[str, Any]:
         fields: dict[str, Any] = {
             self.settings.title_field: brief.title,
             self.settings.status_field: self.settings.processing_status,
-            "需求背景": brief.background,
-            "业务目标": brief.goal,
-            "功能要求": brief.requirements,
-            "约束条件": brief.constraints,
-            "验收标准": brief.acceptance,
-            "优先级": brief.priority,
-            "期望上线时间": brief.due_date,
-            "相关链接": brief.links,
-            "来源": brief.source,
+            # Store chat content losslessly. Dates, people and links cannot be
+            # written as arbitrary strings into typed Bitable columns.
+            self.settings.raw_field: brief.raw_text,
         }
         if brief.requester_id:
             fields[self.settings.requester_field] = [{"id": brief.requester_id}]
@@ -113,7 +115,7 @@ def _sections(text: str) -> dict[str, str]:
     result = {name: "" for name in DETAIL_FIELDS}
     current = ""
     for raw_line in text.splitlines():
-        line = raw_line.strip().lstrip("-").strip()
+        line = re.sub(r"^[#\-\s]+", "", raw_line).strip()
         matched = _split_labeled_line(line)
         if matched is None:
             if current:
@@ -123,6 +125,8 @@ def _sections(text: str) -> dict[str, str]:
         if name in result:
             current = name
             result[name] = value
+        elif name == "需求标题":
+            current = ""
         elif current:
             result[current] = _join(result[current], line)
     return result
@@ -130,7 +134,7 @@ def _sections(text: str) -> dict[str, str]:
 
 def _labeled_value(text: str, name: str) -> str:
     for raw_line in text.splitlines():
-        matched = _split_labeled_line(raw_line.strip())
+        matched = _split_labeled_line(re.sub(r"^[#\-\s]+", "", raw_line).strip())
         if matched is not None and matched[0] == name:
             return matched[1]
     return ""
@@ -157,12 +161,16 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return re.sub(r"\s+", " ", value).strip()
+        return value.strip()
     if isinstance(value, (int, float, bool)):
         return str(value)
     if isinstance(value, list):
         return "、".join(item for item in (_text(item) for item in value) if item)
     if isinstance(value, Mapping):
+        link = value.get("link") or value.get("url")
+        if link:
+            label = value.get("text") or value.get("name")
+            return f"{label} ({link})" if label and label != link else str(link)
         for key in ("text", "name", "value", "link", "url"):
             if key in value:
                 found = _text(value.get(key))

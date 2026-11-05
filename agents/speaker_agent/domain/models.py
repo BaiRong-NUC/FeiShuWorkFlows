@@ -16,15 +16,6 @@ class DemandRecord:
 
 
 @dataclass(frozen=True)
-class Proposal:
-    title: str
-    markdown: str
-    summary: str
-    document_url: str = ""
-    document_token: str = ""
-
-
-@dataclass(frozen=True)
 class ProcessingResult:
     record_id: str
     ok: bool

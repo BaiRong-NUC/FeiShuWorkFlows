@@ -1,0 +1,8 @@
+{
+    "include": ["agents", "tests"],
+    "exclude": [".venv", "runtime"],
+    "venvPath": ".",
+    "venv": ".venv",
+    "pythonVersion": "3.11",
+    "typeCheckingMode": "standard"
+}
