@@ -65,6 +65,7 @@ class Settings:
     sheet_note_field: str = "Agent备注"
     message_mode: str = "personal"
     personal_poll_seconds: int = 10
+    personal_include_self: bool = False
 
     @property
     def feishu(self) -> FeishuConfig:
@@ -126,6 +127,7 @@ class Settings:
             sheet_note_field=_value("FEISHU_SHEETS_NOTE_FIELD", "Agent备注"),
             message_mode=_value("FEISHU_MESSAGE_MODE", "personal").lower(),
             personal_poll_seconds=int(_value("FEISHU_PERSONAL_POLL_SECONDS", "10")),
+            personal_include_self=_bool("FEISHU_PERSONAL_INCLUDE_SELF", False),
         )
 
     def validate_for_startup(self) -> None:

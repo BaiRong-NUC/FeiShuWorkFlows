@@ -57,9 +57,11 @@ class PersonalIntake:
                 batch["attempts"] += 1
                 self.inbox.save(batch)
                 try:
+                    LOGGER.info("开始识别个人消息：消息=%s，字符数=%s", demand.message_id, len(demand.text))
                     decision = (self.interpreter.interpret(demand.text) if self.interpreter else
                                 IntakeDecision(True, title=demand.text.splitlines()[0][:100], requirements=demand.text))
                     batch["decision"] = asdict(parse_intake_decision(asdict(decision)))
+                    LOGGER.info("个人消息识别完成：消息=%s，是否需求=%s", demand.message_id, decision.is_requirement)
                 except ModelError as exc:
                     if exc.retryable and batch["attempts"] < 3:
                         raise
@@ -87,6 +89,8 @@ class PersonalIntake:
                     agent.workflows.save_intake(demand.message_id, {"source": asdict(demand), "attempts": 1,
                                                                  "reply_uuid": uuid, "decision": batch["decision"]})
                 agent.accept_message(demand)
+                LOGGER.info("个人需求已交接：消息=%s，台账=%s", demand.message_id, agent.settings.source_table)
         if batch["reply"]:
             self.workspace.feishu.messages.reply_text(demand.message_id, batch["reply"], uuid=uuid)
+            LOGGER.info("个人消息已回复：消息=%s", demand.message_id)
         self.inbox.finish(batch, time.time())

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -9,6 +10,8 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import ListChatRequest, ListMessageRequest
 from shared.feishu.auth.oauth import AccessTokenProvider
 from shared.feishu.errors import FeishuApiError, require_service, required_data
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -76,8 +79,10 @@ def next_page(has_more: bool | None, token: str | None, seen: set[str]) -> str:
 
 
 class PersonalChatClient:
-    def __init__(self, client: lark.Client, tokens: AccessTokenProvider) -> None:
+    def __init__(self, client: lark.Client, tokens: AccessTokenProvider, *,
+                 own_id: str = "", include_self: bool = False) -> None:
         self.client, self.tokens = client, tokens
+        self.own_id, self.include_self = own_id, include_self
 
     def chats(self) -> list[PersonalChat]:
         result: dict[str, PersonalChat] = {}
@@ -97,6 +102,7 @@ class PersonalChatClient:
     def messages(self, chat: PersonalChat, start: int, end: int) -> list[PersonalMessage]:
         result: dict[str, PersonalMessage] = {}
         token, seen = "", set()
+        received, skipped_self = 0, 0
         while True:
             request = (ListMessageRequest.builder().container_id_type("chat").container_id(chat.chat_id)
                        .start_time(str(start)).end_time(str(end)).sort_type("ByCreateTimeAsc")
@@ -104,13 +110,18 @@ class PersonalChatClient:
             data = required_data(require_service(self.client.im).v1.message.list(
                 request, user_options(request, self.tokens)), "读取个人单聊消息")
             for message in data.items or []:
+                received += 1
                 sender = message.sender
                 if message.deleted or not sender or sender.sender_type != "user":
                     continue
                 if sender.id_type != "open_id":
                     raise FeishuApiError("个人消息发送人不是 open_id，停止读取以避免误识别账号")
                 sender_id = sender.id
-                if not sender_id or sender_id != chat.peer_id or not message.message_id:
+                if sender_id and sender_id == self.own_id and not self.include_self:
+                    skipped_self += 1
+                    continue
+                allowed = sender_id == chat.peer_id or (self.include_self and sender_id == self.own_id)
+                if not sender_id or not allowed or not message.message_id:
                     continue
                 text = message_text(message.msg_type or "", message.body.content or "") if message.body else ""
                 if text and message.create_time is not None:
@@ -118,4 +129,8 @@ class PersonalChatClient:
                                                                  sender_id, text, int(message.create_time))
             token = next_page(data.has_more, data.page_token, seen)
             if not token:
+                if received:
+                    LOGGER.info("单聊读取：会话=%s，接口消息=%s，可处理文本=%s，过滤本人=%s，其他过滤=%s",
+                                chat.chat_id, received, len(result), skipped_self,
+                                received - len(result) - skipped_self)
                 return sorted(result.values(), key=lambda message: (message.created_ms, message.message_id))

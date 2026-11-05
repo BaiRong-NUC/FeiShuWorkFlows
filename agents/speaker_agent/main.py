@@ -167,10 +167,14 @@ def run_personal(settings: Settings) -> None:
     namespace = hashlib.sha256((settings.app_id + ":" + profile["open_id"]).encode()).hexdigest()[:20]
     personal_settings = replace(settings, runtime_dir=settings.runtime_dir / "personal" / namespace)
     # 账号隔离业务队列，切换授权账号后不会回复原账号的任务。
-    inbox = PersonalInbox(personal_settings.runtime_dir / "inbox.sqlite3", int(time.time() * 1000))
+    inbox = PersonalInbox(personal_settings.runtime_dir / "inbox.sqlite3", int(time.time() * 1000),
+                          own_id=profile["open_id"], include_self=settings.personal_include_self)
     feishu = FeishuClient(settings.feishu, user_tokens=oauth)
+    feishu.messages.observer = inbox
     agent = SpeakerWorkspace(personal_settings, feishu=feishu)
-    poller = PersonalPoller(PersonalChatClient(feishu.client, oauth), inbox, profile["open_id"])
+    poller = PersonalPoller(PersonalChatClient(feishu.client, oauth, own_id=profile["open_id"],
+                                             include_self=settings.personal_include_self),
+                            inbox, profile["open_id"], include_self=settings.personal_include_self)
     intake = PersonalIntake(agent, inbox)
     threads: list[threading.Thread] = []
     try:
@@ -181,6 +185,8 @@ def run_personal(settings: Settings) -> None:
             threads.append(thread)
         LOGGER.info("个人飞书模式已启动；使用用户授权，无消息长连接；账号：%s", profile.get("name", ""))
         LOGGER.info("下层交接目录：%s", personal_settings.runtime_dir / "handoff")
+        LOGGER.info("个人消息接入=%s；接收本人手动消息=%s；自动回复始终排除",
+                    settings.enable_chat_commands, settings.personal_include_self)
         while not agent._stopped.is_set():
             if settings.enable_chat_commands:
                 try:

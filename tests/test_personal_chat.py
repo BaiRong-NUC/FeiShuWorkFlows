@@ -189,6 +189,18 @@ class PersonalApiTests(unittest.TestCase):
             self.api.messages(self.chat, 10, 20)
         self.assertEqual(self.sdk.im.v1.message.list.call_count, 2)
 
+    def test_own_messages_require_explicit_test_mode_and_unknown_senders_stay_filtered(self):
+        self.sdk.im.v1.message.list.return_value = ListMessageResponse({"code": 0, "data": {"items": [
+            {"message_id": who, "msg_type": "text", "create_time": "11000",
+             "sender": {"id": who, "id_type": "open_id", "sender_type": "user"},
+             "body": {"content": '{"text":"测试消息"}'}}
+            for who in ("ou_peer", "ou_self", "ou_unrelated")
+        ]}})
+        normal = PersonalChatClient(self.sdk, self.tokens, own_id="ou_self")
+        testing = PersonalChatClient(self.sdk, self.tokens, own_id="ou_self", include_self=True)
+        self.assertEqual([m.sender_id for m in normal.messages(self.chat, 10, 20)], ["ou_peer"])
+        self.assertEqual({m.sender_id for m in testing.messages(self.chat, 10, 20)}, {"ou_self", "ou_peer"})
+
     def test_user_reply_failure_never_retries_as_bot(self):
         self.sdk.im.v1.message.reply.return_value = ReplyMessageResponse({"code": 999, "msg": "permission denied"})
         messages = MessageClient(self.sdk, user_tokens=self.tokens)
@@ -329,6 +341,76 @@ class PersonalIntakeTests(unittest.TestCase):
         self.assertEqual(self.inbox.cursor(other.chat_id), 168)
         self.assertEqual(api.messages.call_count, 2)
         self.assertEqual(self.inbox.pending(200)[0]["source"]["message_id"], "other")
+
+    def test_test_mode_accepts_new_own_messages_and_preserves_first_start_boundary(self):
+        own = PersonalMessage("manual", self.chat.chat_id, "ou_self", "我发的测试需求", 120000)
+        normal = PersonalInbox(self.inbox.path, 110000, own_id="ou_self")
+        self.assertEqual(normal.stage(self.chat, [own], 130), 0)
+        testing = PersonalInbox(self.inbox.path, 110000, own_id="ou_self", include_self=True)
+        older = replace(own, message_id="older", created_ms=109999)
+        peer = replace(own, message_id="peer", sender_id="ou_peer", created_ms=105000)
+        self.assertEqual(testing.stage(self.chat, [own, older, peer], 130), 2)
+        self.assertEqual(testing.stage(self.chat, [own], 130), 0)
+        self.assertEqual(testing.started_ms, 100000)
+
+    def test_polling_in_test_mode_includes_self_chat(self):
+        api = Mock()
+        self_chat = PersonalChat("oc_self", "ou_self")
+        api.chats.return_value = [self_chat]
+        api.messages.return_value = [PersonalMessage("manual", "oc_self", "ou_self", "你好", 110000)]
+        inbox = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        with patch("agents.speaker_agent.adapters.feishu.personal.time.time", return_value=200):
+            PersonalPoller(api, inbox, "ou_self", include_self=True).poll()
+        self.assertEqual(inbox.pending(200)[0]["source"]["message_id"], "manual")
+
+    def test_automatic_reply_is_excluded_before_response_and_after_restart(self):
+        inbox = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        self.stage("source", "你好")
+        sdk = Mock()
+        tokens = Mock()
+        tokens.access_token.return_value = "fixture-token"
+        client = MessageClient(sdk, user_tokens=tokens)
+        client.observer = inbox
+        now = int(time.time() * 1000)
+        reply = PersonalMessage("automatic", self.chat.chat_id, "ou_self", "本人不在", now)
+
+        def response(*args):
+            # 模拟另一线程已读到自动回复，但发送接口尚未返回消息 ID。
+            self.assertEqual(inbox.stage(self.chat, [reply], now // 1000), 0)
+            return ReplyMessageResponse({"code": 0, "data": {"message_id": "automatic"}})
+
+        sdk.im.v1.message.reply.side_effect = response
+        client.reply_text("source", "本人不在", uuid="stable")
+        restarted = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        # 消息 ID 持久化后，即使正文变化，也不会把程序回复重新交给模型。
+        self.assertEqual(restarted.stage(self.chat, [replace(reply, text="更改后的自动回复")], now // 1000), 0)
+        self.assertEqual(restarted.stage(self.chat, [replace(reply, message_id="manual", text="新的手动测试")], now // 1000), 1)
+
+    def test_lost_send_response_does_not_loop_or_filter_peers_and_other_chats(self):
+        inbox = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        self.stage("source", "你好")
+        sdk = Mock()
+        sdk.im.v1.message.reply.side_effect = RuntimeError("发送后响应丢失")
+        client = MessageClient(sdk)
+        client.observer = inbox
+        with self.assertRaises(RuntimeError):
+            client.reply_text("source", "本人不在", uuid="stable")
+        restarted = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        now = int(time.time() * 1000)
+        automatic = PersonalMessage("automatic", self.chat.chat_id, "ou_self", "本人不在", now)
+        self.assertEqual(restarted.stage(self.chat, [automatic], now // 1000), 0)
+        self.assertEqual(restarted.stage(self.chat, [replace(automatic, message_id="peer", sender_id="ou_peer")], now // 1000), 1)
+        other = PersonalChat("oc_other", "ou_other")
+        self.assertEqual(restarted.stage(other, [replace(automatic, message_id="other", chat_id=other.chat_id)], now // 1000), 1)
+
+    def test_proactive_send_intent_is_scoped_to_recipient(self):
+        inbox = PersonalInbox(self.inbox.path, 100000, own_id="ou_self", include_self=True)
+        inbox.before_send("open_id", "ou_peer", "处理完成")
+        now = int(time.time() * 1000)
+        outgoing = PersonalMessage("sent", self.chat.chat_id, "ou_self", "处理完成", now)
+        self.assertEqual(inbox.stage(self.chat, [outgoing], now // 1000), 0)
+        other = PersonalChat("oc_other", "ou_other")
+        self.assertEqual(inbox.stage(other, [replace(outgoing, chat_id=other.chat_id)], now // 1000), 1)
 
     def test_interrupted_personal_runtime_stops_workers_without_bot_socket(self):
         workspace = Mock()

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import time
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
@@ -12,8 +14,11 @@ from shared.feishu.personal import PersonalChat, PersonalMessage
 
 class PersonalInbox:
     """先原子保存消息和读取位置，再执行大模型或台账操作。"""
-    def __init__(self, path: Path, started_ms: int) -> None:
+    def __init__(self, path: Path, started_ms: int, *, own_id: str = "", include_self: bool = False) -> None:
         self.path = path
+        self.own_id, self.include_self = own_id, include_self
+        # 自测只接收本次启动后手动发出的本人消息，不补处理旧自动回复。
+        self.self_started_ms = started_ms
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as db:
             db.executescript("""
@@ -27,6 +32,11 @@ class PersonalInbox:
                     done INTEGER NOT NULL DEFAULT 0, ready REAL NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS contexts (
                     chat TEXT PRIMARY KEY, text TEXT NOT NULL, expires REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS sent_messages (id TEXT PRIMARY KEY);
+                CREATE TABLE IF NOT EXISTS outgoing_attempts (
+                    target_type TEXT NOT NULL, target_id TEXT NOT NULL,
+                    digest TEXT NOT NULL, started_ms INTEGER NOT NULL);
+                CREATE INDEX IF NOT EXISTS outgoing_digest ON outgoing_attempts(digest,started_ms);
             """)
             db.execute("INSERT OR IGNORE INTO metadata VALUES ('started_ms',?)", (started_ms,))
             self.started_ms = int(db.execute("SELECT value FROM metadata WHERE key='started_ms'").fetchone()[0])
@@ -45,15 +55,48 @@ class PersonalInbox:
             row = db.execute("SELECT end FROM cursors WHERE chat=?", (chat,)).fetchone()
             return max(self.started_ms // 1000, int(row[0]) - 30 if row else 0)
 
-    def stage(self, chat: PersonalChat, messages: list[PersonalMessage], end: int) -> None:
+    def before_send(self, target_type: str, target_id: str, text: str) -> None:
+        with self.connect() as db:
+            if target_type == "message_id":
+                row = db.execute("SELECT chat FROM messages WHERE id=?", (target_id,)).fetchone()
+                target_type, target_id = ("chat_id", row[0]) if row else ("unknown", "")
+            db.execute("INSERT INTO outgoing_attempts VALUES (?,?,?,?)",
+                       (target_type, target_id, self._digest(text), int(time.time() * 1000)))
+
+    def after_send(self, message_id: str) -> None:
+        with self.connect() as db:
+            db.execute("INSERT OR IGNORE INTO sent_messages VALUES (?)", (message_id,))
+
+    @staticmethod
+    def _digest(text: str) -> str:
+        return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+
+    def _is_automatic(self, db: sqlite3.Connection, chat: PersonalChat, item: PersonalMessage) -> bool:
+        if db.execute("SELECT 1 FROM sent_messages WHERE id=?", (item.message_id,)).fetchone():
+            return True
+        # 发送成功但响应丢失/尚未保存 ID 时，用发送前持久化的会话、正文摘要和时间窗口兜底。
+        attempts = db.execute("SELECT target_type,target_id FROM outgoing_attempts WHERE digest=? AND started_ms BETWEEN ? AND ?",
+                              (self._digest(item.text), item.created_ms - 180000, item.created_ms + 30000))
+        return any(kind == "unknown" or (kind == "chat_id" and target == chat.chat_id) or
+                   (kind == "open_id" and target == chat.peer_id) for kind, target in attempts)
+
+    def stage(self, chat: PersonalChat, messages: list[PersonalMessage], end: int) -> int:
+        accepted = 0
         with self.connect() as db:
             for item in messages:
-                if item.chat_id != chat.chat_id or item.sender_id != chat.peer_id or item.created_ms < self.started_ms:
+                if item.chat_id != chat.chat_id or item.created_ms < self.started_ms:
                     continue
-                db.execute("INSERT OR IGNORE INTO messages(id,chat,sender,text,created) VALUES (?,?,?,?,?)",
-                           (item.message_id, item.chat_id, item.sender_id, item.text, item.created_ms))
+                if self.own_id and item.sender_id == self.own_id:
+                    if (not self.include_self or item.created_ms < self.self_started_ms or
+                            self._is_automatic(db, chat, item)):
+                        continue
+                elif item.sender_id != chat.peer_id:
+                    continue
+                accepted += db.execute("INSERT OR IGNORE INTO messages(id,chat,sender,text,created) VALUES (?,?,?,?,?)",
+                                       (item.message_id, item.chat_id, item.sender_id, item.text, item.created_ms)).rowcount
             db.execute("INSERT INTO cursors VALUES (?,?) ON CONFLICT(chat) DO UPDATE SET end=MAX(end,excluded.end)",
                        (chat.chat_id, end))
+        return accepted
 
     def pending(self, now: float) -> list[dict]:
         with self.connect() as db:
