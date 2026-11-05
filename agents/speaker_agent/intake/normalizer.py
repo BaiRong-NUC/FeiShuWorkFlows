@@ -8,6 +8,7 @@ from typing import Any
 from agents.speaker_agent.config import Settings
 from agents.speaker_agent.domain.contracts import RequirementBrief
 from agents.speaker_agent.domain.models import DemandRecord, IncomingDemand
+from agents.speaker_agent.domain.intake import IntakeDecision, TEXT_FIELDS
 
 
 DETAIL_FIELDS = (
@@ -100,6 +101,15 @@ class RequirementNormalizer:
         if brief.requester_id:
             fields[self.settings.requester_field] = [{"id": brief.requester_id}]
         return {key: value for key, value in fields.items() if _present(value)}
+
+    def from_decision(self, demand: IncomingDemand, decision: IntakeDecision) -> RequirementBrief:
+        # Only business fields may come from the model. Identity and routing stay local.
+        brief = replace(
+            self.from_message(demand),
+            **{name: getattr(decision, name) for name in TEXT_FIELDS},
+            clarification_questions=decision.clarification_questions,
+        )
+        return replace(brief, missing_fields=_missing(brief))
 
 
 def _missing(brief: RequirementBrief) -> tuple[str, ...]:

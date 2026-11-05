@@ -25,6 +25,7 @@ class RequirementBrief:
     source_message_id: str = ""
     source_chat_id: str = ""
     request_id: str = ""
+    clarification_questions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

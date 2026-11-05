@@ -1,5 +1,5 @@
 {
-    "include": ["agents", "tests"],
+    "include": ["agents", "shared", "tests"],
     "exclude": [".venv", "runtime"],
     "venvPath": ".",
     "venv": ".venv",

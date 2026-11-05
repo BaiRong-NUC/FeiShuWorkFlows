@@ -97,6 +97,7 @@ def settings(runtime_dir: Path) -> Settings:
         log_level="INFO",
         bot_open_id="ou_bot",
         status_field_id="fld_status",
+        intake_mode="rules",
     )
 
 

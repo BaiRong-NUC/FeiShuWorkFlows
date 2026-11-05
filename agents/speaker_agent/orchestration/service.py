@@ -14,10 +14,15 @@ from agents.speaker_agent.config import Settings
 from agents.speaker_agent.domain.contracts import DownstreamResult, RequirementBrief, result_from_dict
 from agents.speaker_agent.downstream.bridge import DownstreamAgent, FileDownstreamAgent
 from agents.speaker_agent.domain.ports import DemandGateway
-from agents.speaker_agent.intake.normalizer import RequirementNormalizer
+from agents.speaker_agent.intake.normalizer import DETAIL_FIELDS, RequirementNormalizer
 from agents.speaker_agent.domain.models import IncomingDemand, ProcessingResult
 from agents.speaker_agent.presentation.reply import ReplyFormatter
 from agents.speaker_agent.persistence.state import ProcessedEventStore, WorkflowStore
+from shared.llm.deepseek import DeepSeekClient
+from shared.llm.contracts import ModelError
+from agents.speaker_agent.domain.intake import DemandInterpreter, parse_intake_decision
+from agents.speaker_agent.intake.interpreter import ModelDemandInterpreter
+from agents.speaker_agent.presentation.brief import BriefFormatter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,11 +43,16 @@ class DemandAgent:
                  downstream: DownstreamAgent | None = None,
                  normalizer: RequirementNormalizer | None = None,
                  formatter: ReplyFormatter | None = None,
+                 interpreter: DemandInterpreter | None = None,
                  store: ProcessedEventStore | None = None) -> None:
         self.settings = settings
         self.gateway = gateway
         self.downstream = downstream or FileDownstreamAgent(settings.runtime_dir / "handoff")
         self.normalizer = normalizer or RequirementNormalizer(settings)
+        self.interpreter = interpreter
+        if self.interpreter is None and settings.intake_mode == "deepseek":
+            self.interpreter = ModelDemandInterpreter(DeepSeekClient(settings.deepseek), max_chars=settings.intake_max_chars)
+        self.brief_formatter = BriefFormatter()
         self.formatter = formatter or ReplyFormatter(settings.reply_template)
         self.store = store or ProcessedEventStore(settings.runtime_dir / "processed-events.json")
         self.workflows = WorkflowStore(settings.runtime_dir / "speaker.sqlite3")
@@ -136,7 +146,7 @@ class DemandAgent:
                 return
             accepted = self.enqueue_record(record_id, reply_to_message_id=message_id)
             self.gateway.reply_text(message_id, "已接收，正在读取台账。" if accepted else "该记录已在处理。")
-        elif command in {"需求", "/demand", "demand"} or _looks_like_requirement(text):
+        elif command in {"需求", "/demand", "demand"} or self.interpreter is not None or _looks_like_requirement(text):
             content = argument if command in {"需求", "/demand", "demand"} else text
             if not content.strip():
                 self.gateway.reply_text(message_id, "请在“需求”后填写需求描述。")
@@ -146,21 +156,31 @@ class DemandAgent:
             self.gateway.reply_text(message_id, "如需建档，请发送：需求 具体描述；发送“帮助”查看用法。")
 
     def help_text(self) -> str:
+        intake_hint = ("新需求：直接描述想改进的事情或遇到的问题，也可粘贴聊天内容（支持多行）\n"
+                       if self.interpreter is not None else "新需求：需求 具体描述（支持多行）\n")
         return (f"台账状态改为“{self.settings.trigger_status}”后自动整理。\n"
-                "新需求：需求 具体描述（支持多行）\n"
+                + intake_hint +
                 "已有记录：整理需求 记录ID或链接；仍需处于待处理状态。")
 
     def _intake(self, item: WorkItem) -> dict | None:
         draft = None
         if item.source_message:
             demand = item.source_message
-            draft = self.normalizer.from_message(demand)
+            draft = self._message_draft(demand)
+            if draft is None:
+                return None
             token, record_id = self.workflows.creation(demand.message_id)
             if not record_id:
-                record_id = self.gateway.create_record(self.normalizer.ledger_fields(draft), client_token=token)
+                fields = self.normalizer.ledger_fields(draft)
+                if self.interpreter is not None:
+                    fields[self.settings.brief_field] = self.brief_formatter.render(draft)
+                record_id = self.gateway.create_record(fields, client_token=token)
                 self.workflows.created(demand.message_id, record_id)
         else:
             record_id = item.record_id
+            cached = self.workflows.intake_for_record(record_id)
+            if cached and cached.get("decision"):
+                draft = self.normalizer.from_decision(IncomingDemand(**cached["source"]), parse_intake_decision(cached["decision"]))
         record = self.gateway.get_record(record_id)
         if record.status not in {self.settings.trigger_status, self.settings.processing_status}:
             return None
@@ -181,14 +201,50 @@ class DemandAgent:
         if previous and previous["state"] != "done":
             previous["state"] = "superseded"
             self.workflows.save_job(previous)
+        # Fingerprints always describe source data, never nondeterministic model output.
+        # Preserve the model's structured draft only while its original source is unchanged.
+        if (draft and self.interpreter is not None and brief.raw_text == draft.raw_text
+                and record.title == draft.title and not any(record.fields.get(name) for name in DETAIL_FIELDS)):
+            brief = replace(draft, record_id=record.record_id, record_url=record.record_url, requester_id=record.requester_id)
         request_id = str(uuid4())
         brief = replace(brief, request_id=request_id)
         job = {"id": request_id, "brief": asdict(brief), "fingerprint": fingerprint,
-               "reply_to": item.reply_to_message_id, "state": "waiting", "result": {},
+               "reply_to": item.reply_to_message_id or brief.source_message_id, "state": "waiting", "result": {},
                "acknowledged": False, "delivery": {}, "written": False,
                "document_token": "", "document_url": ""}
         self.workflows.save_job(job)
         return job
+
+    def _message_draft(self, demand: IncomingDemand) -> RequirementBrief | None:
+        if self.interpreter is None:
+            return self.normalizer.from_message(demand)
+        cached = self.workflows.get_intake(demand.message_id) or {
+            "source": asdict(demand), "attempts": 0, "reply_uuid": str(uuid4()), "decision": None,
+        }
+        if not cached["decision"] and not cached.get("terminal"):
+            if cached["attempts"] >= 3:
+                cached["terminal"] = True
+            else:
+                cached["attempts"] += 1
+                self.workflows.save_intake(demand.message_id, cached)
+                try:
+                    decision = parse_intake_decision(asdict(self.interpreter.interpret(demand.text)))
+                    cached["decision"] = asdict(decision)
+                except ModelError as exc:
+                    cached["error"] = str(exc)
+                    cached["terminal"] = not exc.retryable or cached["attempts"] >= 3
+                    self.workflows.save_intake(demand.message_id, cached)
+                    if not cached["terminal"]:
+                        raise
+            self.workflows.save_intake(demand.message_id, cached)
+        if cached.get("terminal"):
+            self.gateway.reply_text(demand.message_id, "需求整理暂未成功，尚未新建台账。请检查模型配置或缩短内容后重新发送。", uuid=cached["reply_uuid"])
+            return None
+        decision = parse_intake_decision(cached["decision"])
+        if not decision.is_requirement:
+            self.gateway.reply_text(demand.message_id, "暂未识别到具体需求。可以描述想改进的事情或遇到的问题，我会整理成需求单。", uuid=cached["reply_uuid"])
+            return None
+        return self.normalizer.from_decision(demand, decision)
 
     def _advance(self, job: dict) -> ProcessingResult:
         brief = RequirementBrief(**job["brief"])
@@ -311,7 +367,7 @@ class DemandAgent:
 
 def _fingerprint(brief: RequirementBrief) -> str:
     fields = asdict(brief)
-    for key in ("source", "source_message_id", "source_chat_id", "request_id", "record_url"):
+    for key in ("source", "source_message_id", "source_chat_id", "request_id", "record_url", "clarification_questions"):
         fields.pop(key, None)
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 

@@ -38,6 +38,8 @@ class ReplyFormatter:
         ]
         if brief.missing_fields:
             lines.append("当前缺少：" + "、".join(brief.missing_fields) + "。")
+        if brief.clarification_questions:
+            lines.append("待确认：" + "；".join(brief.clarification_questions[:3]))
         if brief.record_url:
             lines.append(f"台账：{brief.record_url}")
         return "\n".join(lines)
@@ -61,6 +63,7 @@ def _risks(
     review: ReviewResult | None,
 ) -> list[str]:
     items = [f"待补充：{name}" for name in brief.missing_fields]
+    items.extend(brief.clarification_questions)
     if analysis is not None:
         items.extend(analysis.risks)
         items.extend(analysis.open_questions)

@@ -245,7 +245,11 @@ class WorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         values = dotenv_values(root / ".env.example", encoding="utf-8")
         self.assertEqual(values["FEISHU_TRIGGER_STATUS"], "待生成方案")
-        for path in [root / "README.md", root / ".env.example", *root.glob("agents/**/*.py")]:
+        paths = [root / "README.md", root / "AGENTS.md", root / ".env.example"]
+        for package in ("agents", "shared"):
+            paths.extend(root.glob(f"{package}/**/*.py"))
+            paths.extend(root.glob(f"{package}/**/*.md"))
+        for path in paths:
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("\\u", text, str(path))
             self.assertNotIn(chr(0xFFFD), text, str(path))

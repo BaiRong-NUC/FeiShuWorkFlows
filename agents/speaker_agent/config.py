@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from shared.llm.config import DeepSeekConfig
 
 
 class ConfigError(ValueError):
@@ -49,6 +50,10 @@ class Settings:
     reply_template: Path | None = None
     create_documents: bool = False
     status_field_id: str = ""
+    intake_mode: str = "deepseek"
+    deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
+    intake_max_chars: int = 12000
+    brief_field: str = "需求单"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -102,9 +107,28 @@ class Settings:
             reply_template=Path(_value("SPEAKER_REPLY_TEMPLATE")) if _value("SPEAKER_REPLY_TEMPLATE") else None,
             create_documents=_bool("FEISHU_CREATE_DOCUMENTS", False),
             status_field_id=_value("FEISHU_STATUS_FIELD_ID"),
+            intake_mode=_value("SPEAKER_INTAKE_MODE", "deepseek").lower(),
+            deepseek=DeepSeekConfig.from_env(),
+            intake_max_chars=int(_value("SPEAKER_INTAKE_MAX_CHARS", "12000")),
+            brief_field=_value("FEISHU_BRIEF_FIELD", "需求单"),
         )
 
     def validate_for_startup(self) -> None:
         if not self.result_field or not self.raw_field:
             raise ConfigError("FEISHU_RESULT_FIELD and FEISHU_RAW_FIELD are required")
+        self.validate_intake()
         # A notification group is optional; the originating chat/requester is sufficient.
+
+    def validate_intake(self) -> None:
+        if self.intake_mode not in {"deepseek", "rules"}:
+            raise ConfigError("SPEAKER_INTAKE_MODE 必须是 deepseek 或 rules")
+        if self.intake_mode == "rules":
+            return
+        self.deepseek.validate()
+        if not 1 <= self.intake_max_chars <= 50000:
+            raise ConfigError("SPEAKER_INTAKE_MAX_CHARS 须在 1–50000 之间")
+        if not self.brief_field or self.brief_field in {
+            self.raw_field, self.result_field, self.status_field, self.title_field,
+            self.requester_field, self.error_field, self.proposal_field,
+        }:
+            raise ConfigError("FEISHU_BRIEF_FIELD 必须是独立的需求单文本列")

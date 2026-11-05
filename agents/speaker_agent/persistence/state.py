@@ -85,6 +85,8 @@ class WorkflowStore:
                     id TEXT PRIMARY KEY, record_id TEXT NOT NULL, payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS creations (
                     message_id TEXT PRIMARY KEY, token TEXT NOT NULL, record_id TEXT NOT NULL DEFAULT '');
+                CREATE TABLE IF NOT EXISTS intakes (
+                    message_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
             """)
 
     @contextmanager
@@ -146,3 +148,21 @@ class WorkflowStore:
     def created(self, message_id: str, record_id: str) -> None:
         with self.connect() as db:
             db.execute("UPDATE creations SET record_id=? WHERE message_id=?", (record_id, message_id))
+
+    def get_intake(self, message_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT payload FROM intakes WHERE message_id=?", (message_id,)).fetchone()
+            return json.loads(row[0]) if row else None
+
+    def save_intake(self, message_id: str, payload: dict) -> None:
+        with self.connect() as db:
+            db.execute("""INSERT INTO intakes(message_id,payload) VALUES (?,?)
+                       ON CONFLICT(message_id) DO UPDATE SET payload=excluded.payload""",
+                       (message_id, json.dumps(payload, ensure_ascii=False)))
+
+    def intake_for_record(self, record_id: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("""SELECT intakes.payload FROM intakes JOIN creations
+                               ON intakes.message_id=creations.message_id WHERE creations.record_id=?""",
+                             (record_id,)).fetchone()
+            return json.loads(row[0]) if row else None
