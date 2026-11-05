@@ -49,7 +49,6 @@ class SheetGateway(FeishuDelivery):
         if not required.issubset(headers) or not self._description_field(headers):
             raise FeishuApiError(f"工作表“{self.ref.title}”需要 ID、状态，以及描述或需求原文列")
         result: list[tuple[int, dict[str, Any]]] = []
-        ids: set[str] = set()
         for number, row in enumerate(rows[1:], start=2):
             fields = {name: row[i] if i < len(row) else "" for i, name in enumerate(headers) if name}
             record_id = _text(fields.get(self.settings.sheet_id_field))
@@ -57,11 +56,27 @@ class SheetGateway(FeishuDelivery):
                 if _text(fields.get(self.settings.status_field)) == self.settings.trigger_status:
                     LOGGER.warning("工作表 %s 第 %s 行缺少 ID，已跳过", self.ref.title, number)
                 continue
-            if record_id in ids:
-                raise FeishuApiError(f"工作表“{self.ref.title}”的 ID 不唯一，停止处理以避免回填错误")
-            ids.add(record_id)
             result.append((number, fields))
         return headers, result
+
+    def _duplicate_ids(self, rows: list[tuple[int, dict[str, Any]]]) -> dict[str, list[int]]:
+        locations: dict[str, list[int]] = {}
+        for number, fields in rows:
+            record_id = _text(fields.get(self.settings.sheet_id_field))
+            locations.setdefault(record_id, []).append(number)
+        return {record_id: numbers for record_id, numbers in locations.items() if len(numbers) > 1}
+
+    @staticmethod
+    def _duplicate_details(duplicates: dict[str, list[int]]) -> str:
+        details = []
+        for record_id, numbers in list(duplicates.items())[:5]:
+            positions = "、".join(map(str, numbers[:20]))
+            if len(numbers) > 20:
+                positions += f"等共 {len(numbers)} 行"
+            details.append(f"ID {record_id[:80]!r}：第 {positions} 行")
+        if len(duplicates) > 5:
+            details.append(f"共 {len(duplicates)} 组重复 ID，仅列出前 5 组")
+        return "；".join(details)
 
     def _description_field(self, headers: list[str]) -> str:
         return next((name for name in (self.settings.raw_field, "描述") if name in headers), "")
@@ -86,14 +101,25 @@ class SheetGateway(FeishuDelivery):
 
     def list_records_by_status(self, status: str) -> list[DemandRecord]:
         headers, rows = self._read()
+        # Check all rows, including completed and untriggered rows: a pending row
+        # is still ambiguous if another row with the same ID has a different status.
+        duplicates = self._duplicate_ids(rows)
+        if duplicates:
+            LOGGER.warning("工作表“%s”跳过重复 ID 对应的全部记录，其他唯一 ID 正常处理：%s",
+                           self.ref.title, self._duplicate_details(duplicates))
         return [self._record(number, fields, headers) for number, fields in rows
-                if _text(fields.get(self.settings.status_field)) == status]
+                if _text(fields.get(self.settings.status_field)) == status
+                and _text(fields.get(self.settings.sheet_id_field)) not in duplicates]
 
     def _find(self, rows: list[tuple[int, dict[str, Any]]], record_id: str) -> tuple[int, dict[str, Any]]:
-        for number, fields in rows:
-            if _text(fields.get(self.settings.sheet_id_field)) == record_id:
-                return number, fields
-        raise FeishuApiError(f"工作表“{self.ref.title}”中找不到记录 ID")
+        matches = [(number, fields) for number, fields in rows
+                   if _text(fields.get(self.settings.sheet_id_field)) == record_id]
+        if len(matches) > 1:
+            details = self._duplicate_details({record_id: [number for number, _ in matches]})
+            raise FeishuApiError(f"工作表“{self.ref.title}”的 ID 不唯一：{details}；拒绝处理该 ID，避免回填错误")
+        if not matches:
+            raise FeishuApiError(f"工作表“{self.ref.title}”中找不到记录 ID")
+        return matches[0]
 
     def _columns(self, headers: list[str], names: list[str]) -> list[str]:
         missing = list(dict.fromkeys(name for name in names if name not in headers))
@@ -136,6 +162,7 @@ class SheetGateway(FeishuDelivery):
         with self._lock:
             headers, rows = self._read()
             if any(_text(row.get(self.settings.sheet_id_field)) == record_id for _, row in rows):
+                self._find(rows, record_id)
                 return record_id
             mapped = {self.settings.sheet_id_field: record_id,
                       self._description_field(headers): fields.get(self.settings.raw_field, ""),

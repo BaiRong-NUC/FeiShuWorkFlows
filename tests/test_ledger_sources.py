@@ -138,6 +138,57 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(record.fields[self.config.raw_field], "第一行\n第二行")
         self.assertEqual(record.requester_id, "ou_requester")
 
+    def test_historical_duplicate_ids_do_not_block_unique_records_or_chat_creation(self):
+        original = copy.deepcopy(self.api.rows["one"][2])
+        self.api.rows["one"].extend([copy.deepcopy(original), [2]])
+        with self.assertLogs("agents.speaker_agent.adapters.feishu.sheets_gateway", level="WARNING") as log:
+            pending = self.gateway.list_records_by_status("待生成方案")
+        self.assertEqual([record.record_id for record in pending], ["1"])
+        self.assertIn("ID '2'：第 3、4、5 行", "\n".join(log.output))
+        self.assertEqual(self.api.writes, [])
+        self.gateway.write_result("1", "唯一记录的结果")
+        self.assertEqual(self.api.rows["one"][2:5], [original, original, [2]])
+        new_id = self.gateway.create_record({self.config.raw_field: "新的聊天需求"}, client_token="new-chat")
+        self.assertEqual(self.gateway.get_record(new_id).fields[self.config.raw_field], "新的聊天需求")
+        self.gateway.update_status(new_id, "生成中")
+        self.assertEqual(self.api.rows["one"][2:5], [original, original, [2]])
+
+    def test_duplicate_id_is_skipped_even_when_only_one_matching_row_is_pending(self):
+        self.api.rows["one"][2][0] = 1
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(self.gateway.list_records_by_status("待生成方案"), [])
+        with self.assertRaisesRegex(FeishuApiError, "第 2、3 行"):
+            self.gateway.get_record("1")
+        with self.assertRaisesRegex(FeishuApiError, "不唯一"):
+            self.gateway.write_result("1", "不能回填任意一行")
+        self.assertEqual(self.api.writes, [])
+
+    def test_duplicate_created_id_cannot_be_reused_as_successful_creation(self):
+        self.api.rows["one"][1][0] = "spk_existing"
+        self.api.rows["one"][2][0] = "spk_existing"
+        before = copy.deepcopy(self.api.rows)
+        with self.assertRaisesRegex(FeishuApiError, "不唯一"):
+            self.gateway.create_record({self.config.raw_field: "新内容"}, client_token="existing")
+        self.assertEqual(self.api.rows, before)
+        self.assertEqual(self.api.writes, [])
+
+    def test_duplicate_introduced_during_update_is_rejected_before_data_write(self):
+        self.api.rows["one"][0].append(self.config.sheet_note_field)
+        original_read = self.api.read_range
+        reads = 0
+
+        def read(token: str, range_name: str) -> list[list[Any]]:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self.api.rows["one"][2][0] = 1
+            return original_read(token, range_name)
+
+        with patch.object(self.api, "read_range", side_effect=read):
+            with self.assertRaisesRegex(FeishuApiError, "不唯一"):
+                self.gateway.update_status("1", "生成中")
+        self.assertEqual(self.api.writes, [])
+
     def test_output_columns_cannot_overwrite_source_columns(self):
         with self.assertRaisesRegex(ValueError, "独立列"):
             SheetGateway(replace(self.config, result_field="描述"), self.api.refs[0], feishu=self.api)
