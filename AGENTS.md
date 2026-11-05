@@ -3,6 +3,7 @@
 - 各 Agent 的业务代码放在 `agents/<agent_name>/`，当前最上层为 `agents/speaker_agent/`。
 - 可被多个 Agent 复用的大模型调用、飞书 API、连接、配置和通用接口放在 `shared/`，公共模块不依赖 `agents/`。需求字段映射、状态流转、事件触发策略、回复模块、提示词和业务模板保留在各 Agent 下。
 - 每个 Agent 按功能拆分子包；接入、领域契约、需求整理、编排、持久化和展示不要混放在根目录。
+- 项目统一入口为根目录 `main.py`，仅负责环境检查、Agent 注册和生命周期管理。通用进程管理放在 `shared/runtime/`；Agent 启动模块支持不访问外部服务的 `--check`。
 - 各 Agent 的 Markdown 模板放在自身的 `templates/` 文件夹。Speaker 的回复模板是 `agents/speaker_agent/templates/reply.md`。
 - Speaker 负责接收和整理需求、交接下层、汇总结果、回填和回复。技术方案、工期和分析结论必须来自下层返回，不自行编造。
 - 源码、文档、模板和示例配置使用 UTF-8 与可读中文；不要把中文和引号写成字面量 Unicode 转义。

@@ -9,6 +9,7 @@ Speaker 默认使用 DeepSeek 理解聊天中的需求意图，整理标题、�
 Agent 业务代码放在 `agents/` 下，后续分析、评审等 Agent 与 `speaker_agent/` 并列。大模型调用和飞书 API 等可复用基础模块放在 `shared/`；需求字段映射、状态流转、回复模块和业务模板留在各 Agent 下。
 
 ```text
+main.py                     # 项目统一入口：检查、启动和停止所有已注册 Agent
 agents/
   speaker_agent/
     main.py                 # 飞书长连接启动入口
@@ -24,6 +25,7 @@ agents/
 shared/
   feishu/                   # 公共飞书连接、表格、消息、云文档、权限及接口
   llm/                      # 公共 DeepSeek 客户端、模型配置、调用接口和异常
+  runtime/                  # 通用进程管理、退出信号和实例锁
 tests/                      # 本地替身测试，不连接真实飞书或 DeepSeek
 runtime/                    # 本地运行数据，不提交 Git
 ```
@@ -89,18 +91,48 @@ FEISHU_BRIEF_FIELD=需求单
 
 ## 启动与检查
 
+在项目根目录直接运行 `main.py`，或在 VS Code 中运行该 Python 文件：
+
 ```powershell
 cd D:\WorkFlows\FeiShuWorkFlows
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-Copy-Item .env.example .env
-# 编辑 .env，填写飞书配置和 DEEPSEEK_API_KEY
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
-.\.venv\Scripts\python.exe -m pyright
-.\.venv\Scripts\python.exe -m agents.speaker_agent.main
+python main.py
 ```
 
-已有 `.venv` 或 `.env` 时直接沿用，不覆盖实际配置。VS Code 解释器选择 `.venv/Scripts/python.exe`。源码、模板、文档和 `.env` 使用 UTF-8；加载配置和模板兼容 UTF-8 BOM。
+Git Bash 中同样执行：
+
+```bash
+cd /d/WorkFlows/FeiShuWorkFlows
+python main.py
+```
+
+需要安装 Python 3.11 或更新版本。统一入口自动定位项目根目录，并使用本项目 `.venv` 中的解释器运行 Agent；无需手动激活虚拟环境。如果缺少 `.venv`，首次运行会创建环境并安装 `requirements.txt`，需要联网下载依赖。缺少 `.env` 时只复制示例，不覆盖已有配置；首次填写飞书配置和 `DEEPSEEK_API_KEY` 后再次运行即可。
+
+启动前逐一检查已注册 Agent 的依赖、配置和模板，任何一个检查失败都不会启动业务进程。当前只有 Speaker 已实现：一次启动包含飞书长连接、需求处理队列和启用后的台账轮询。需求分析与技术评审 Agent 尚未实现，不会启动占位进程。
+
+所有日志在同一终端显示。保持窗口运行，按 **Ctrl+C** 停止项目。控制器通知各 Agent 退出，等待最多 10 秒后终止仍未退出的进程；Speaker 会先停止队列和轮询，未完成的持久化任务下次启动继续处理。任一 Agent 异常退出时，控制器会停止其他 Agent 并返回非零退出码，不自动反复重启。
+
+统一入口与 Speaker 各自使用操作系统文件锁防止重复启动；锁文件在 `runtime/` 下，进程结束会释放锁，不需要手动删除文件。锁不保证强制结束控制器或关闭终端窗口时执行完整清理，正常停止请使用 Ctrl+C。
+
+可选命令：
+
+```powershell
+python main.py --check           # 只检查本地配置与模板，不调用飞书或模型
+python main.py --list            # 查看已注册的 Agent
+python main.py --agents speaker  # 只运行指定 Agent
+python main.py --setup           # 安装或修复运行依赖，保留现有 .env
+```
+
+`--check` 只验证本地条件，不验证真实 Key、飞书权限或网络可达性。后续 Agent 的业务代码仍放在 `agents/<name>/`；实现 `python -m agents.<name>.main`、`--check` 和退出信号处理后，在根目录 `main.py` 的 `AGENTS` 清单中注册，默认启动全部已注册项。
+
+开发验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m pyright
+```
+
+VS Code 解释器选择 `.venv/Scripts/python.exe`。源码、模板、文档和 `.env` 使用 UTF-8；加载配置和模板兼容 UTF-8 BOM。
 
 ## 使用
 
@@ -125,7 +157,7 @@ Speaker 的三个模板均在 `agents/speaker_agent/templates/`：`intake_prompt
 
 ## 当前边界
 
-- 本地单进程版本：持久队列、需求快照和回填/通知检查点保存在 `runtime/speaker.sqlite3`。同一运行目录只启动一个 Speaker 实例。
+- 本地部署：统一控制器为每个已注册 Agent 启动独立进程，当前只有 Speaker。Speaker 的持久队列、需求快照和回填/通知检查点保存在 `runtime/speaker.sqlite3`，同一运行目录只启动一个 Speaker 实例。
 - 当前支持文本会话和一张台账；不自动抓取任意人的历史聊天，不解析附件、图片或转发消息包。可把聊天内容复制到“需求”消息中。
 - 每条提交的消息独立整理，可在一条消息中粘贴多轮聊天；暂未自动合并会话前后文，也不把后续补充自动关联到旧需求。需要补充时可更新台账字段并重新触发。
 - 下层结果必须带匹配的 `request_id`；需求内容或状态已变更时，旧结果不会回填。修改后把台账设回待处理状态以发起新一轮。

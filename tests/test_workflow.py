@@ -248,7 +248,7 @@ class WorkflowTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         values = dotenv_values(root / ".env.example", encoding="utf-8")
         self.assertEqual(values["FEISHU_TRIGGER_STATUS"], "待生成方案")
-        paths = [root / "README.md", root / "AGENTS.md", root / ".env.example"]
+        paths = [root / "README.md", root / "AGENTS.md", root / ".env.example", root / "main.py"]
         for package in ("agents", "shared"):
             paths.extend(root.glob(f"{package}/**/*.py"))
             paths.extend(root.glob(f"{package}/**/*.md"))
