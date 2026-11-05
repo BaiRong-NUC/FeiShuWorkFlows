@@ -8,7 +8,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from dotenv import dotenv_values
 
@@ -173,6 +173,24 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(required(self.agent.process_item(item)).ok)
         self.assertEqual(len(self.gateway.created), 1)
         self.assertEqual(len(self.gateway.client_tokens[0]), 36)
+
+    def test_failed_job_backoff_is_shared_by_queue_and_resume_and_survives_restart(self):
+        self.agent.enqueue_record("rec1")
+        item = required(self.agent._next_item())
+        with patch("agents.speaker_agent.orchestration.service.time.time", return_value=1000), \
+             patch.object(self.gateway, "update_status", side_effect=FeishuApiError("写入失败")) as update:
+            with self.assertLogs("agents.speaker_agent.orchestration.service", level="ERROR"):
+                self.assertFalse(required(self.agent.process_item(item)).ok)
+            self.assertEqual(update.call_count, 1)
+            restarted = DemandAgent(self.config, self.gateway)
+            restarted.resume_pending()
+            self.assertFalse(required(restarted.process_item(item)).ok)
+            self.assertEqual(update.call_count, 1)
+            job = required(restarted.workflows.latest_job("rec1"))
+            self.assertEqual(job["retry_at"], 1030)
+        with patch("agents.speaker_agent.orchestration.service.time.time", return_value=1030):
+            restarted.resume_pending()
+        self.assertTrue(required(restarted.workflows.get_job(job["id"]))["acknowledged"])
 
     def test_duplicate_events_do_not_acknowledge_twice(self):
         self.start_record()

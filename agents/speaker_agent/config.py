@@ -61,8 +61,6 @@ class Settings:
     chat_target: str = ""
     source_table: str = ""
     source_kind: str = "bitable"
-    sheet_id_field: str = "ID"
-    sheet_note_field: str = "Agent备注"
     message_mode: str = "personal"
     personal_poll_seconds: int = 10
     personal_include_self: bool = False
@@ -123,8 +121,6 @@ class Settings:
             brief_field=_value("FEISHU_BRIEF_FIELD", "需求单"),
             ledger_urls=urls,
             chat_target=_value("SPEAKER_CHAT_TARGET"),
-            sheet_id_field=_value("FEISHU_SHEETS_ID_FIELD", "ID"),
-            sheet_note_field=_value("FEISHU_SHEETS_NOTE_FIELD", "Agent备注"),
             message_mode=_value("FEISHU_MESSAGE_MODE", "personal").lower(),
             personal_poll_seconds=int(_value("FEISHU_PERSONAL_POLL_SECONDS", "10")),
             personal_include_self=_bool("FEISHU_PERSONAL_INCLUDE_SELF", False),
@@ -141,8 +137,6 @@ class Settings:
             parse_file_url(url)
         if not self.ledger_urls:
             raise ConfigError("请填写台账文件链接")
-        if not self.sheet_id_field or not self.sheet_note_field:
-            raise ConfigError("电子表格的 ID 列与 Agent 备注列名称不能为空")
         if not self.result_field or not self.raw_field:
             raise ConfigError("FEISHU_RESULT_FIELD and FEISHU_RAW_FIELD are required")
         self.validate_intake()

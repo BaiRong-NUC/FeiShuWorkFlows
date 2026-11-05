@@ -44,6 +44,12 @@ class MemoryWorkspace(FakeFeishuServices):
         self.writes: list[tuple[str, str, list[list[Any]]]] = []
         self.replies: list[tuple[str, str]] = []
         self.lose_append_response = False
+        self.dropdowns: dict[str, list[str]] = {}
+
+    def read_dropdowns(self, token: str, range_name: str) -> list[dict[str, Any]]:
+        column = re.sub(r"\d+.*", "", range_name.split("!", 1)[1])
+        values = self.dropdowns.get(column)
+        return [{"conditionValues": values, "dataValidationType": "list", "ranges": [range_name]}] if values is not None else []
 
     def discover(self, urls: tuple[str, ...]) -> list[TableReference]:
         return self.refs[:]
@@ -54,7 +60,7 @@ class MemoryWorkspace(FakeFeishuServices):
     def write_ranges(self, token: str, ranges: list[tuple[str, list[list[Any]]]]) -> None:
         for name, values in ranges:
             self.writes.append((token, name, values))
-            match = required(re.fullmatch(r"([^!]+)!([A-Z]+)(\d+)(?::[A-Z]+\d+)?", name))
+            match = required(re.fullmatch(r"([^!]+)!([A-Z]+)(\d+):[A-Z]+\d+", name))
             table, column, row = match.groups()
             index = 0
             for char in column:
@@ -111,9 +117,9 @@ class SourceTests(unittest.TestCase):
         self.gateway.write_result("1", "下层返回的结论")
         self.assertEqual(self.api.rows["one"][1][2], "已完成")
         self.assertEqual(self.api.rows["one"][1][6], "历史结果")
-        self.assertEqual(self.api.rows["one"][2][2], "已生成")
-        self.assertEqual(self.api.rows["one"][2][6], "人工备注")
-        self.assertIn("下层返回的结论", self.api.rows["one"][2])
+        self.assertEqual(self.api.rows["one"][2][2], "待生成方案")
+        self.assertEqual(self.api.rows["one"][2][6], "人工备注\n\n下层返回的结论")
+        self.assertEqual(len(self.api.rows["one"][0]), 7)
         self.assertEqual(self.api.rows["two"][1][2], "待生成方案")
 
     def test_duplicate_or_missing_record_ids_never_write(self):
@@ -136,7 +142,10 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(self.api.rows["one"]), 4)
         record = self.gateway.get_record(record_id)
         self.assertEqual(record.fields[self.config.raw_field], "第一行\n第二行")
-        self.assertEqual(record.requester_id, "ou_requester")
+        self.assertEqual(record.requester_id, "")
+        self.assertEqual(len(self.api.rows["one"][0]), 7)
+        self.assertEqual(len(self.api.rows["one"][-1]), 6)
+        self.assertEqual(self.api.rows["one"][-1][3], "")
 
     def test_historical_duplicate_ids_do_not_block_unique_records_or_chat_creation(self):
         original = copy.deepcopy(self.api.rows["one"][2])
@@ -173,7 +182,6 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(self.api.writes, [])
 
     def test_duplicate_introduced_during_update_is_rejected_before_data_write(self):
-        self.api.rows["one"][0].append(self.config.sheet_note_field)
         original_read = self.api.read_range
         reads = 0
 
@@ -186,19 +194,74 @@ class SourceTests(unittest.TestCase):
 
         with patch.object(self.api, "read_range", side_effect=read):
             with self.assertRaisesRegex(FeishuApiError, "不唯一"):
-                self.gateway.update_status("1", "生成中")
+                self.gateway.write_result("1", "结论")
         self.assertEqual(self.api.writes, [])
 
     def test_output_columns_cannot_overwrite_source_columns(self):
-        with self.assertRaisesRegex(ValueError, "独立列"):
-            SheetGateway(replace(self.config, result_field="描述"), self.api.refs[0], feishu=self.api)
+        gateway = SheetGateway(replace(self.config, result_field="描述"), self.api.refs[0], feishu=self.api)
+        original = self.api.rows["one"][1][4]
+        gateway.write_result("1", "结果")
+        self.assertEqual(self.api.rows["one"][1][4], original)
+        self.assertIn("结果", self.api.rows["one"][1][6])
+
+    def test_intake_writes_only_six_columns_and_waiting_never_writes_processing_notes(self):
+        self.api.dropdowns = {"B": ["1.5.1"], "C": ["待修改", "进行中", "已完成"], "D": ["龚柏荣"]}
+        headers = self.api.rows["one"][0][:]
+        record_id = self.gateway.create_record({self.config.raw_field: "缓存冷却改为15s", "版本": "1.5.1",
+                                               "责任人": "龚柏荣", "备注": "仅缓存", self.config.brief_field: "本地需求单"},
+                                              client_token="six-columns")
+        self.gateway.update_status(record_id, "生成中", error="等待下层结果")
+        self.assertEqual(self.api.rows["one"][0], headers)
+        self.assertEqual(self.api.rows["one"][-1], [record_id, "1.5.1", "待修改", "龚柏荣", "缓存冷却改为15s", "仅缓存"])
+        self.assertEqual(self.api.writes, [])
+        self.gateway.write_result(record_id, "下层结果")
+        self.gateway.write_result(record_id, "下层结果")
+        self.assertEqual(self.api.rows["one"][-1][6], "下层结果")
+        self.assertEqual(self.api.rows["one"][-1][2], "待修改")
+        self.assertEqual(self.api.rows["one"][0], headers)
+        self.assertTrue(all(re.fullmatch(r"one!G\d+:G\d+", name) for _, name, _ in self.api.writes))
+
+    def test_processing_note_header_is_added_only_when_lower_result_arrives(self):
+        self.api.rows["one"] = [row[:6] for row in self.api.rows["one"]]
+        self.gateway.create_record({self.config.raw_field: "新需求"}, client_token="six")
+        self.gateway.update_status("1", "生成中", error="等待")
+        self.assertEqual(len(self.api.rows["one"][0]), 6)
+        self.assertEqual(self.api.writes, [])
+        self.gateway.write_result("1", "下层结论")
+        self.assertEqual(self.api.rows["one"][0], ["ID", "版本", "状态", "责任人", "描述", "备注", "处理备注"])
+        self.assertEqual(self.api.rows["one"][1][6], "下层结论")
+
+    def test_dropdowns_are_checked_and_leaf_pending_option_is_used(self):
+        self.api.dropdowns = {"B": ["1.1.0"], "C": ["待处理", "已完成", "暂搁置"], "D": ["龚柏荣"]}
+        for invalid in ({"版本": "9.9.9"}, {"责任人": "ou_requester"}):
+            with self.assertRaisesRegex(FeishuApiError, "不在已有下拉选项"):
+                self.gateway.create_record({self.config.raw_field: "需求", **invalid})
+        self.assertEqual(len(self.api.rows["one"]), 3)
+        self.gateway.create_record({self.config.raw_field: "新需求"}, client_token="leaf")
+        self.assertEqual(self.api.rows["one"][-1][1:4], ["", "待处理", ""])
+        self.assertEqual(self.api.writes, [])
+
+    def test_completed_sheet_analysis_is_not_recreated_while_development_is_pending(self):
+        self.api.rows["one"][1][2] = "待修改"
+        workspace = SpeakerWorkspace(self.config, feishu=self.api)
+        agent = workspace.agents[self.api.refs[0].key]
+        agent.scan_pending()
+        self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+        job = required(agent.workflows.latest_job("1"))
+        agent.submit_result(job["id"], DownstreamResult(AnalysisResult("分析"), ReviewResult("评审")))
+        writes = len(self.api.writes)
+        agent.scan_pending()
+        self.assertIsNone(agent.process_item(required(agent._next_item())))
+        self.assertEqual(required(agent.workflows.latest_job("1"))["id"], job["id"])
+        self.assertEqual(len(self.api.writes), writes)
+        self.assertEqual(self.api.rows["one"][1][2], "待修改")
 
     def test_unnamed_column_data_and_padded_empty_cells_are_preserved(self):
         self.api.rows["one"][1].append("没有标题的人工内容")
         self.api.rows["one"][0].extend([""] * 19)
         self.gateway.write_result("1", "结论")
         self.assertEqual(self.api.rows["one"][1][7], "没有标题的人工内容")
-        self.assertEqual(self.api.rows["one"][0][8], "处理结论")
+        self.assertEqual(self.api.rows["one"][0][8], "")
 
     def test_identical_row_ids_across_tables_have_separate_jobs_and_correct_writeback(self):
         workspace = SpeakerWorkspace(self.config, feishu=self.api)
@@ -211,8 +274,8 @@ class SourceTests(unittest.TestCase):
         self.assertNotEqual(jobs[0]["id"], jobs[1]["id"])
         self.assertEqual(len(list((self.root / "handoff/outbox").glob("*.json"))), 2)
         agents[0].submit_result(jobs[0]["id"], DownstreamResult(AnalysisResult("分析"), ReviewResult("评审")))
-        self.assertEqual(self.api.rows["one"][1][2], "已生成")
-        self.assertEqual(self.api.rows["two"][1][2], "生成中")
+        self.assertEqual(self.api.rows["one"][1][2], "待生成方案")
+        self.assertEqual(self.api.rows["two"][1][2], "待生成方案")
         restarted = SpeakerWorkspace(self.config, feishu=self.api)
         self.assertEqual(required(list(restarted.agents.values())[1].workflows.latest_job("1"))["id"], jobs[1]["id"])
 

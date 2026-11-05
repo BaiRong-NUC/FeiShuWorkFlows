@@ -99,6 +99,7 @@ class DemandAgent:
 
     def process_item(self, item: WorkItem) -> ProcessingResult | None:
         with self._lock:
+            job = None
             try:
                 job = self._intake(item)
                 result = self._advance(job) if job else None
@@ -109,18 +110,26 @@ class DemandAgent:
             except Exception as exc:
                 # Preserve both inbox work and the created-record mapping for retry.
                 self.workflows.defer_work(item.key)
+                if job is not None:
+                    self._defer_job(job, exc)
                 LOGGER.exception("Speaker 处理暂未完成，任务已保留，30 秒后重试：%s", item.key)
                 return ProcessingResult(item.record_id, False, "", error=str(exc))
 
     def resume_pending(self) -> None:
         with self._lock:
             for job in self.workflows.unfinished_jobs():
+                if job.get("retry_at", 0) > time.time():
+                    continue
                 try:
                     self._advance(job)
                 except Exception as exc:
-                    job["last_error"] = str(exc)
-                    self.workflows.save_job(job)
-                    LOGGER.error("Speaker job %s awaits retry: %s", job["id"], exc)
+                    self._defer_job(job, exc)
+                    LOGGER.error("Speaker 任务 %s 暂未完成，30 秒后重试：%s", job["id"], exc)
+
+    def _defer_job(self, job: dict, error: Exception) -> None:
+        job["last_error"] = str(error)
+        job["retry_at"] = time.time() + 30
+        self.workflows.save_job(job)
 
     def submit_result(self, request_id: str, result: DownstreamResult) -> ProcessingResult:
         """Internal callback for a future agent transport, never exposed to chat input."""
@@ -193,6 +202,9 @@ class DemandAgent:
                             source_chat_id=draft.source_chat_id)
         fingerprint = _fingerprint(brief)
         previous = self.workflows.latest_job(record_id)
+        if (previous and previous["fingerprint"] == fingerprint and previous["state"] == "done"
+                and self.settings.source_kind == "sheet"):
+            return None
         if previous and previous["fingerprint"] == fingerprint and previous["state"] not in {"done", "superseded"}:
             if item.reply_to_message_id and not previous["reply_to"]:
                 previous["reply_to"] = item.reply_to_message_id
@@ -206,8 +218,12 @@ class DemandAgent:
         # Fingerprints always describe source data, never nondeterministic model output.
         # Preserve the model's structured draft only while its original source is unchanged.
         if (draft and self.interpreter is not None and brief.raw_text == draft.raw_text
-                and record.title == draft.title and not any(record.fields.get(name) for name in DETAIL_FIELDS)):
-            brief = replace(draft, record_id=record.record_id, record_url=record.record_url, requester_id=record.requester_id)
+                and (record.title == draft.title or self.settings.source_kind == "sheet")
+                and not any(record.fields.get(name) for name in DETAIL_FIELDS)):
+            brief = replace(draft, record_id=record.record_id, record_url=record.record_url,
+                            requester_id=record.requester_id or draft.requester_id)
+        if draft:
+            brief = replace(brief, requester_id=brief.requester_id or draft.requester_id)
         request_id = str(uuid4())
         if self.settings.source_table and not brief.source.endswith(" / " + self.settings.source_table):
             brief = replace(brief, source=brief.source + " / " + self.settings.source_table)
@@ -290,6 +306,9 @@ class DemandAgent:
 
     def _advance(self, job: dict) -> ProcessingResult:
         brief = RequirementBrief(**job["brief"])
+        if job.get("retry_at", 0) > time.time():
+            return ProcessingResult(brief.record_id, False, "任务已保留，等待重试")
+        job.pop("retry_at", None)
         if job["state"] == "done":
             return ProcessingResult(brief.record_id, True, job["markdown"], job["document_url"])
         if brief.task_type == "inquiry":

@@ -69,6 +69,14 @@ class SheetsClient:
         self._request(token, "values_batch_update", HttpMethod.POST,
                       body={"valueRanges": [{"range": name, "values": rows} for name, rows in ranges]})
 
+    def read_dropdowns(self, token: str, range_name: str) -> list[dict[str, Any]]:
+        data = self._request(token, "dataValidation", HttpMethod.GET,
+                             queries=[("range", range_name), ("dataValidationType", "list")])
+        rules = data.get("dataValidations", [])
+        if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+            raise FeishuApiError("电子表格下拉规则格式无效")
+        return rules
+
     def append_rows(self, token: str, range_name: str, rows: list[list[Any]]) -> None:
         self._request(token, "values_append", HttpMethod.POST,
                       body={"valueRange": {"range": range_name, "values": rows}, "insertDataOption": "INSERT_ROWS"})

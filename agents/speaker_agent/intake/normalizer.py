@@ -102,6 +102,8 @@ class RequirementNormalizer:
         }
         if brief.requester_id:
             fields[self.settings.requester_field] = [{"id": brief.requester_id}]
+        if self.settings.source_kind == "sheet":
+            fields.update({name: _labeled_value(brief.raw_text, name) for name in ("版本", "责任人", "备注")})
         return {key: value for key, value in fields.items() if _present(value)}
 
     def from_decision(self, demand: IncomingDemand, decision: IntakeDecision) -> RequirementBrief:

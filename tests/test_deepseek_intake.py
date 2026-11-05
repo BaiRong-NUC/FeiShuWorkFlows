@@ -124,7 +124,9 @@ class SemanticIntakeTests(unittest.TestCase):
         self.assertEqual(required(self.agent.workflows.get_job(job["id"]))["state"], "publishing")
         unused_client = FakeCompletion(error=ModelError("重启不应重新识别"))
         restarted = self.make_agent(unused_client)
-        with patch.object(self.gateway, "reply_text") as reply:
+        retry_at = required(restarted.workflows.get_job(job["id"]))["retry_at"]
+        with patch.object(self.gateway, "reply_text") as reply, \
+             patch("agents.speaker_agent.orchestration.service.time.time", return_value=retry_at):
             restarted.resume_pending()
             reply.assert_called_once_with(*failed.call_args.args, **failed.call_args.kwargs)
             self.assertIn(answer, reply.call_args.args[1])
