@@ -3,6 +3,13 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from agents.speaker_agent.domain.models import DemandRecord
+from agents.speaker_agent.config import Settings
+
+
+class MessageReceiver(Protocol):
+    settings: Settings
+
+    def handle_command(self, text: str, message_id: str, sender_id: str = "", chat_id: str = "") -> None: ...
 
 
 class DemandGateway(Protocol):

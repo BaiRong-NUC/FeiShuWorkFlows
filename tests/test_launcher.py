@@ -81,7 +81,7 @@ class LauncherTests(unittest.TestCase):
     def test_speaker_check_does_not_construct_any_network_client(self):
         config = settings(self.root)
         with patch.object(speaker, "load_dotenv"), patch.object(speaker.Settings, "from_env", return_value=config), \
-             patch.object(speaker, "FeishuGateway") as gateway, patch.object(speaker, "create_socket_client") as socket:
+             patch.object(speaker, "SpeakerWorkspace") as gateway, patch.object(speaker, "create_socket_client") as socket:
             self.assertEqual(speaker.main(["--check"]), 0)
             gateway.assert_not_called()
             socket.assert_not_called()
@@ -90,17 +90,18 @@ class LauncherTests(unittest.TestCase):
     def test_speaker_rejects_placeholder_credentials_before_network(self):
         config = replace(settings(self.root), app_id="cli_xxx")
         with patch.object(speaker, "load_dotenv"), patch.object(speaker.Settings, "from_env", return_value=config), \
-             patch.object(speaker, "FeishuGateway") as gateway:
+             patch.object(speaker, "SpeakerWorkspace") as gateway:
             self.assertEqual(speaker.main(["--check"]), 2)
             gateway.assert_not_called()
 
     def test_speaker_stops_worker_when_connection_is_interrupted(self):
         config = replace(settings(self.root), enable_polling=False)
         agent = Mock()
+        agent.tables = {}
         connection = Mock()
         connection.start.side_effect = KeyboardInterrupt
-        with patch.object(speaker, "FeishuGateway"), patch.object(speaker, "DemandAgent", return_value=agent), \
-             patch.object(speaker, "register_handlers"), patch.object(speaker, "create_socket_client", return_value=connection):
+        with patch.object(speaker, "SpeakerWorkspace", return_value=agent), \
+             patch.object(speaker, "create_socket_client", return_value=connection):
             with self.assertRaises(KeyboardInterrupt):
                 speaker.run_agent(config)
         agent.stop.assert_called_once()

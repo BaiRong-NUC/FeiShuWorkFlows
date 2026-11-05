@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from shared.feishu.config import BitableConfig
+from shared.feishu.catalog import TableReference
 
 
 @dataclass(frozen=True)
@@ -38,3 +39,21 @@ class FeishuServices(Protocol):
     def documents(self) -> DocumentAPI: ...
 
     def table(self, config: BitableConfig) -> BitableAPI: ...
+
+
+class CatalogAPI(Protocol):
+    def discover(self, urls: tuple[str, ...]) -> list[TableReference]: ...
+
+
+class SheetsAPI(Protocol):
+    def read_range(self, token: str, range_name: str) -> list[list[Any]]: ...
+    def write_ranges(self, token: str, ranges: list[tuple[str, list[list[Any]]]]) -> None: ...
+    def append_rows(self, token: str, range_name: str, rows: list[list[Any]]) -> None: ...
+
+
+class WorkspaceServices(FeishuServices, Protocol):
+    @property
+    def catalog(self) -> CatalogAPI: ...
+
+    @property
+    def sheets(self) -> SheetsAPI: ...

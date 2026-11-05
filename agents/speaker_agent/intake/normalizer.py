@@ -42,7 +42,7 @@ class RequirementNormalizer:
             record_id=record.record_id,
             title=record.title,
             requester_id=record.requester_id,
-            source=source,
+            source=f"{source} / {self.settings.source_table}" if self.settings.source_table else source,
             background=_text(fields.get("需求背景")),
             goal=_text(fields.get("业务目标")),
             requirements=requirements,

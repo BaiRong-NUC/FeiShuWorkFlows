@@ -6,6 +6,8 @@ from shared.feishu.bitable import BitableClient
 from shared.feishu.config import BitableConfig, FeishuConfig
 from shared.feishu.documents import DocumentClient
 from shared.feishu.messages import MessageClient
+from shared.feishu.catalog import CatalogClient
+from shared.feishu.sheets import SheetsClient
 
 
 class FeishuClient:
@@ -18,6 +20,8 @@ class FeishuClient:
         )
         self.messages = MessageClient(self.client)
         self.documents = DocumentClient(self.client)
+        self.catalog = CatalogClient(self.client)
+        self.sheets = SheetsClient(self.client)
 
     def table(self, config: BitableConfig) -> BitableClient:
         return BitableClient(self.client, config)

@@ -207,6 +207,8 @@ class DemandAgent:
                 and record.title == draft.title and not any(record.fields.get(name) for name in DETAIL_FIELDS)):
             brief = replace(draft, record_id=record.record_id, record_url=record.record_url, requester_id=record.requester_id)
         request_id = str(uuid4())
+        if self.settings.source_table and not brief.source.endswith(" / " + self.settings.source_table):
+            brief = replace(brief, source=brief.source + " / " + self.settings.source_table)
         brief = replace(brief, request_id=request_id)
         job = {"id": request_id, "brief": asdict(brief), "fingerprint": fingerprint,
                "reply_to": item.reply_to_message_id or brief.source_message_id, "state": "waiting", "result": {},
@@ -382,14 +384,19 @@ def _extract_record_id(value: str, settings: Settings) -> str:
     if text.startswith("https://"):
         url = urlparse(text)
         query = parse_qs(url.query)
-        expected_host = urlparse(settings.bitable_url).hostname
+        expected_host = urlparse(settings.source_file_url).hostname
         if not url.hostname or not (url.hostname.endswith(".feishu.cn") or url.hostname == expected_host):
             return ""
-        if "/base/" in url.path and url.path.split("/base/", 1)[1].split("/")[0] != settings.bitable_app_token:
+        expected_path = urlparse(settings.source_file_url).path.rstrip("/")
+        canonical_path = f"/{'sheets' if settings.source_kind == 'sheet' else 'base'}/{settings.source_file_token}"
+        if url.path.rstrip("/") not in {expected_path, canonical_path}:
             return ""
-        if query.get("table", [settings.bitable_table_id])[0] != settings.bitable_table_id:
+        table_key = "sheet" if settings.source_kind == "sheet" else "table"
+        if query.get(table_key, [settings.source_table_id])[0] != settings.source_table_id:
             return ""
         text = query.get("record", [""])[0]
+    if settings.source_kind == "sheet":
+        return text if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", text) else ""
     return text if re.fullmatch(r"rec[A-Za-z0-9]+", text) else ""
 
 

@@ -4,17 +4,16 @@ from typing import Any
 
 from agents.speaker_agent.config import Settings
 from agents.speaker_agent.domain.models import DemandRecord
-from shared.feishu.client import FeishuClient
+from agents.speaker_agent.adapters.feishu.delivery import FeishuDelivery
 from shared.feishu.contracts import BitableRecord, FeishuServices
 from shared.feishu.fields import escape_formula, person_id, plain_text
 
 
-class FeishuGateway:
+class FeishuGateway(FeishuDelivery):
     """Map Speaker requirements to shared Feishu services."""
 
     def __init__(self, settings: Settings, *, feishu: FeishuServices | None = None) -> None:
-        self.settings = settings
-        self.feishu = feishu if feishu is not None else FeishuClient(settings.feishu)
+        super().__init__(settings, feishu=feishu)
         self.table = self.feishu.table(settings.bitable)
 
     def get_record(self, record_id: str) -> DemandRecord:
@@ -54,18 +53,6 @@ class FeishuGateway:
 
     def create_record(self, fields: dict[str, Any], *, client_token: str = "") -> str:
         return self.table.create_record(fields, client_token=client_token)
-
-    def create_proposal_document(self, title: str, markdown: str) -> tuple[str, str]:
-        return self.feishu.documents.create_markdown_document(title, markdown, folder_token=self.settings.doc_folder_token)
-
-    def grant_document_view(self, document_token: str, open_id: str) -> None:
-        self.feishu.documents.grant_document_view(document_token, open_id)
-
-    def send_text(self, receive_id_type: str, receive_id: str, text: str, *, uuid: str = "") -> None:
-        self.feishu.messages.send_text(receive_id_type, receive_id, text, uuid=uuid)
-
-    def reply_text(self, message_id: str, text: str, *, uuid: str = "") -> None:
-        self.feishu.messages.reply_text(message_id, text, uuid=uuid)
 
     def _to_demand(self, record: BitableRecord) -> DemandRecord:
         fields = record.fields

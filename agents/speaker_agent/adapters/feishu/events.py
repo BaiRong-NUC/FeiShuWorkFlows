@@ -6,6 +6,7 @@ import lark_oapi as lark
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandlerBuilder
 
 from agents.speaker_agent.orchestration.service import DemandAgent
+from agents.speaker_agent.domain.ports import MessageReceiver
 from shared.feishu.events import bot_mentioned, event_field_text, parse_text_content, strip_mentions
 
 
@@ -28,9 +29,9 @@ def on_record_changed(agent: DemandAgent, data: lark.drive.v1.P2DriveFileBitable
     header = data.header
     if event is None or header is None:
         return
-    if event.file_token != agent.settings.bitable_app_token:
+    if event.file_token != agent.settings.source_file_token:
         return
-    if event.table_id != agent.settings.bitable_table_id:
+    if event.table_id != agent.settings.source_table_id:
         return
     if event.action_list is None:
         return
@@ -48,7 +49,7 @@ def on_record_changed(agent: DemandAgent, data: lark.drive.v1.P2DriveFileBitable
         )
 
 
-def on_message(agent: DemandAgent, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
+def on_message(agent: MessageReceiver, data: lark.im.v1.P2ImMessageReceiveV1) -> None:
     event = data.event
     if event is None or event.message is None:
         return

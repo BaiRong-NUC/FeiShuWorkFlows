@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from shared.llm.config import DeepSeekConfig
 from shared.feishu.config import BitableConfig, FeishuConfig
+from shared.feishu.catalog import parse_file_url
 
 
 class ConfigError(ValueError):
@@ -26,9 +28,9 @@ def _bool(name: str, default: bool) -> bool:
 class Settings:
     app_id: str
     app_secret: str
-    bitable_app_token: str
-    bitable_table_id: str
-    bitable_url: str
+    source_file_token: str
+    source_table_id: str
+    source_file_url: str
     notify_chat_id: str
     doc_folder_token: str
     trigger_status: str
@@ -55,6 +57,12 @@ class Settings:
     deepseek: DeepSeekConfig = field(default_factory=DeepSeekConfig)
     intake_max_chars: int = 12000
     brief_field: str = "需求单"
+    ledger_urls: tuple[str, ...] = ()
+    chat_target: str = ""
+    source_table: str = ""
+    source_kind: str = "bitable"
+    sheet_id_field: str = "ID"
+    sheet_note_field: str = "Agent备注"
 
     @property
     def feishu(self) -> FeishuConfig:
@@ -62,23 +70,16 @@ class Settings:
 
     @property
     def bitable(self) -> BitableConfig:
-        return BitableConfig(self.bitable_app_token, self.bitable_table_id, self.bitable_url)
+        return BitableConfig(self.source_file_token, self.source_table_id, self.source_file_url)
 
     @classmethod
     def from_env(cls) -> "Settings":
         credentials = FeishuConfig.from_env()
-        bitable_app_token = _value("FEISHU_BITABLE_APP_TOKEN")
-        bitable_table_id = _value("FEISHU_BITABLE_TABLE_ID")
-        missing = [
-            name
-            for name, value in (
-                ("FEISHU_BITABLE_APP_TOKEN", bitable_app_token),
-                ("FEISHU_BITABLE_TABLE_ID", bitable_table_id),
-            )
-            if not value
-        ]
-        if missing:
-            raise ConfigError("missing required environment variables: " + ", ".join(missing))
+        urls = tuple(part.strip() for part in re.split(r"[,;\n]+", _value("FEISHU_LEDGER_URLS")) if part.strip())
+        if not urls:
+            raise ConfigError("请配置 FEISHU_LEDGER_URLS：支持一个或多个电子表格、多维表格或知识库文件链接")
+        for url in urls:
+            parse_file_url(url)
 
         poll_seconds = int(_value("FEISHU_POLL_SECONDS", "300") or "300")
         if poll_seconds < 30:
@@ -88,9 +89,9 @@ class Settings:
         return cls(
             app_id=credentials.app_id,
             app_secret=credentials.app_secret,
-            bitable_app_token=bitable_app_token,
-            bitable_table_id=bitable_table_id,
-            bitable_url=_value("FEISHU_BITABLE_URL"),
+            source_file_token="",
+            source_table_id="",
+            source_file_url="",
             notify_chat_id=_value("FEISHU_NOTIFY_CHAT_ID"),
             doc_folder_token=_value("FEISHU_DOC_FOLDER_TOKEN"),
             trigger_status=_value("FEISHU_TRIGGER_STATUS", "待生成方案"),
@@ -117,9 +118,19 @@ class Settings:
             deepseek=DeepSeekConfig.from_env(),
             intake_max_chars=int(_value("SPEAKER_INTAKE_MAX_CHARS", "12000")),
             brief_field=_value("FEISHU_BRIEF_FIELD", "需求单"),
+            ledger_urls=urls,
+            chat_target=_value("SPEAKER_CHAT_TARGET"),
+            sheet_id_field=_value("FEISHU_SHEETS_ID_FIELD", "ID"),
+            sheet_note_field=_value("FEISHU_SHEETS_NOTE_FIELD", "Agent备注"),
         )
 
     def validate_for_startup(self) -> None:
+        for url in self.ledger_urls:
+            parse_file_url(url)
+        if not self.ledger_urls:
+            raise ConfigError("请填写台账文件链接")
+        if not self.sheet_id_field or not self.sheet_note_field:
+            raise ConfigError("电子表格的 ID 列与 Agent 备注列名称不能为空")
         if not self.result_field or not self.raw_field:
             raise ConfigError("FEISHU_RESULT_FIELD and FEISHU_RAW_FIELD are required")
         self.validate_intake()

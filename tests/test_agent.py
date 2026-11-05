@@ -76,9 +76,10 @@ def settings(runtime_dir: Path) -> Settings:
     return Settings(
         app_id="cli_test",
         app_secret="secret",
-        bitable_app_token="base-token",
-        bitable_table_id="tbl-token",
-        bitable_url="",
+        source_file_token="base-token",
+        source_table_id="tbl-token",
+        source_file_url="",
+        ledger_urls=("https://example.feishu.cn/base/base-token",),
         notify_chat_id="oc_chat",
         doc_folder_token="",
         trigger_status="待生成方案",

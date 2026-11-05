@@ -10,9 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from agents.speaker_agent.config import ConfigError, Settings
-from agents.speaker_agent.adapters.feishu.events import register_handlers
-from agents.speaker_agent.adapters.feishu.gateway import FeishuGateway
-from agents.speaker_agent.orchestration.service import DemandAgent
+from agents.speaker_agent.adapters.feishu.events import on_message
+from agents.speaker_agent.orchestration.workspace import SpeakerWorkspace
+from shared.feishu.client import FeishuClient
 from shared.feishu.connection import create_socket_client, new_event_dispatcher
 from agents.speaker_agent.presentation.brief import BriefFormatter
 from agents.speaker_agent.presentation.reply import ReplyFormatter
@@ -24,19 +24,20 @@ LOGGER = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[2]
 
 
-def check_configuration() -> Settings:
+def check_configuration(*, for_discovery: bool = False) -> Settings:
     load_dotenv(ROOT / ".env", encoding="utf-8-sig")
     settings = Settings.from_env()
-    settings.validate_for_startup()
+    if not for_discovery:
+        settings.validate_for_startup()
     placeholders = {
         "FEISHU_APP_ID": (settings.app_id, "cli_xxx"),
         "FEISHU_APP_SECRET": (settings.app_secret, "your_app_secret"),
-        "FEISHU_BITABLE_APP_TOKEN": (settings.bitable_app_token, "your_base_token"),
-        "FEISHU_BITABLE_TABLE_ID": (settings.bitable_table_id, "tbl_xxx"),
     }
     missing = [key for key, (value, example) in placeholders.items() if value == example]
     if missing:
         raise ConfigError("请替换 .env 中的示例配置：" + ", ".join(missing))
+    if for_discovery:
+        return settings
     ReplyFormatter(settings.reply_template)
     BriefFormatter()
     if settings.intake_mode == "deepseek":
@@ -48,11 +49,13 @@ def check_configuration() -> Settings:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Speaker Agent")
-    parser.add_argument("--check", action="store_true", help="只检查本地配置和模板")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--check", action="store_true", help="只检查本地配置和模板")
+    modes.add_argument("--discover", action="store_true", help="只读发现所有文件内的数据表，不启动工作流")
     args = parser.parse_args(argv)
     os.chdir(ROOT)
     try:
-        settings = check_configuration()
+        settings = check_configuration(for_discovery=args.discover)
     except (OSError, ValueError, KeyError) as exc:
         print(f"Speaker 配置检查失败：{exc}")
         return 2
@@ -65,11 +68,17 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if args.discover:
+            tables = FeishuClient(settings.feishu).catalog.discover(settings.ledger_urls)
+            for ref in tables:
+                print(f"{ref.kind} | {ref.file_title or ref.file_token} | {ref.title} | {ref.table_id}\n  {ref.url}")
+            print(f"共发现 {len(tables)} 张表；未读取消息、未写入台账、未调用大模型。")
+            return 0
         with interrupt_signals(), InstanceLock(settings.runtime_dir / "speaker.lock"):
             run_agent(settings)
     except KeyboardInterrupt:
         LOGGER.info("Speaker 已停止")
-    except RuntimeError as exc:
+    except (RuntimeError, ValueError) as exc:
         LOGGER.error("Speaker 启动失败：%s", exc)
         return 1
     return 0
@@ -77,14 +86,15 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_agent(settings: Settings) -> None:
     if settings.enable_chat_commands and not settings.bot_open_id:
-        LOGGER.warning("FEISHU_BOT_OPEN_ID 未设置：仅接收私聊，群聊不会触发建档")
+        LOGGER.warning("FEISHU_BOT_OPEN_ID 未设置：仅接收发给机器人的私聊，群聊不会触发建档；个人账号私聊尚未接入")
 
-    gateway = FeishuGateway(settings)
-    agent = DemandAgent(settings, gateway)
-    dispatcher = register_handlers(
-        new_event_dispatcher(),
-        agent,
-    ).build()
+    agent = SpeakerWorkspace(settings)
+    if not settings.enable_polling and any(ref.kind == "sheet" for ref in agent.tables.values()):
+        raise ConfigError("普通电子表格通过轮询接入，请设置 FEISHU_ENABLE_POLLING=true")
+    builder = new_event_dispatcher().register_p2_drive_file_bitable_record_changed_v1(agent.on_record_event)
+    if settings.enable_chat_commands:
+        builder.register_p2_im_message_receive_v1(lambda data: on_message(agent, data))
+    dispatcher = builder.build()
 
     threads: list[threading.Thread] = []
     try:
@@ -109,7 +119,7 @@ def run_agent(settings: Settings) -> None:
             LOGGER.warning("仍有请求未结束，持久化队列将在下次启动时恢复")
 
 
-def _poll_loop(agent: DemandAgent, interval_seconds: int) -> None:
+def _poll_loop(agent: SpeakerWorkspace, interval_seconds: int) -> None:
     while not agent._stopped.is_set():
         try:
             accepted = agent.scan_pending()
