@@ -110,29 +110,43 @@ class SpeakerWorkspace:
         if agent is not None:
             on_record_changed(agent, data)
 
-    def handle_command(self, text: str, message_id: str, sender_id: str = "", chat_id: str = "") -> None:
+    def table_names(self) -> str:
+        with self._lock:
+            return "、".join(ref.title for ref in self.tables.values())
+
+    def agent_for(self, key: str) -> DemandAgent | None:
+        with self._lock:
+            return self.agents.get(key) if key in self.tables else None
+
+    def select_target(self, text: str, *, use_default: bool = True) -> str:
         with self._lock:
             refs = list(self.tables.values())
         explicit = re.match(r"^台账\s*[:：]\s*([^\n]+)\n?(.*)$", text.strip(), re.S)
         target = explicit[1].strip() if explicit else ""
-        content = explicit[2].strip() if explicit else text
         if explicit:
             candidates = [ref for ref in refs if target in {ref.title, ref.key}]
         else:
             candidates = self._link_targets(text, refs)
             if not candidates:
                 candidates = [ref for ref in refs if ref.title.casefold() in text.casefold()]
-            if not candidates and self.settings.chat_target:
+            if not candidates and use_default and self.settings.chat_target:
                 candidates = [ref for ref in refs if self.settings.chat_target in {ref.title, ref.key}]
-            if not candidates and len(refs) == 1:
+            if not candidates and use_default and len(refs) == 1:
                 candidates = refs
-        if len(candidates) != 1:
-            names = "、".join(ref.title for ref in refs)
+        return candidates[0].key if len(candidates) == 1 else ""
+
+    def handle_command(self, text: str, message_id: str, sender_id: str = "", chat_id: str = "") -> None:
+        key = self.select_target(text)
+        agent = self.agent_for(key)
+        if agent is None:
+            names = self.table_names()
             self.feishu.messages.reply_text(
                 message_id, f"请在原需求前添加一行“台账：工作表名称”后重新发送。可选：{names}。同名表请使用 文件类型/文件token/表ID。",
                 uuid=hashlib.sha256(("route:" + message_id).encode()).hexdigest()[:32])
             return
-        self.agents[candidates[0].key].handle_command(content, message_id, sender_id, chat_id)
+        explicit = re.match(r"^台账\s*[:：]\s*([^\n]+)\n?(.*)$", text.strip(), re.S)
+        content = explicit[2].strip() if explicit else text
+        agent.handle_command(content, message_id, sender_id, chat_id)
 
     @staticmethod
     def _link_targets(text: str, refs: list[TableReference]) -> list[TableReference]:

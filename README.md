@@ -2,7 +2,7 @@
 
 当前实现最上层 Speaker Agent：接收台账或会话需求、整理需求单、交给下层需求分析与技术评审，再按 Markdown 模板回填原台账并回复需求人。
 
-最终目标是接收别人发给你的个人飞书账号的私聊。**当前消息入口仍是应用机器人，个人账号私聊尚未接通**；App ID / Secret 仍需保留，个人入口还需要用户登录授权、Token 刷新，以及个人消息读取和发送能力验证。详见 [个人私聊接入边界](agents/speaker_agent/docs/personal-chat.md)。
+默认接入别人发给你的**个人飞书账号私聊**，不使用机器人消息长连接。通过用户 OAuth 授权，自动发现单聊、增量轮询、理解需求并回复原消息。App ID / Secret 继续保留；个人消息用用户身份，现有台账读写仍用应用身份。代码通过本地替身验证，实际收发取决于租户权限与登录授权。先按 [个人私聊接入说明](agents/speaker_agent/docs/personal-chat.md) 配置应用能力、权限和重定向地址。
 
 Speaker 默认使用 DeepSeek 理解聊天中的需求意图，整理标题、背景、目标、需求描述、约束、验收信息和待确认问题，同时保留完整原文。需求分析、技术方案、工期和评审结论仍由下层 Agent 返回；下层 Agent 尚未实现。
 
@@ -14,7 +14,7 @@ Agent 业务代码放在 `agents/` 下，后续分析、评审等 Agent 与 `spe
 main.py                     # 项目统一入口：检查、启动和停止所有已注册 Agent
 agents/
   speaker_agent/
-    main.py                 # 飞书长连接启动入口
+    main.py                 # 个人私聊轮询、台账轮询和工作流启动入口
     config.py               # 环境配置
     adapters/feishu/         # 需求台账映射、消息路由和状态触发策略
     domain/                 # 需求模型、结果契约、外部 I/O 接口
@@ -67,12 +67,12 @@ FEISHU_LEDGER_URLS=https://example.feishu.cn/wiki/你的节点Token,https://exam
 
 ## 飞书配置
 
-1. 创建企业自建应用并启用机器人。
-2. 按来源开通电子表格或多维表格读写权限；知识库链接还需要 `wiki:node:read`（或知识库只读权限）。机器人消息入口需要接收消息及以机器人身份回复/发送消息的权限。
-3. 长连接订阅 `drive.file.bitable_record_changed_v1` 和 `im.message.receive_v1`。
-4. 发布应用，并授予应用目标台账的编辑权限。
-5. 群聊需配置 `FEISHU_BOT_OPEN_ID`；仅真正 @此机器人时接收需求。未配置时只接收发给机器人的私聊和台账事件，不接收发给个人账号的私聊。
-6. `FEISHU_NOTIFY_CHAT_ID` 可选；不填则只回复原消息或提出人。
+1. 保留或创建企业自建应用，按飞书消息 API 的前置条件保留/开启机器人能力；程序不以机器人身份收发个人消息。
+2. 按 [个人私聊配置](agents/speaker_agent/docs/personal-chat.md) 申请用户身份的会话、单聊读取和个人发送权限，并设置 OAuth 重定向 URL。
+3. 台账继续使用应用身份：开通电子表格或多维表格读写权限；知识库链接还需要 `wiki:node:read`，并授予应用目标文件的编辑权限。
+4. 发布应用版本使权限生效，执行 `python main.py --login` 完成个人授权。
+5. 用 `--check-user` 和 `--discover` 分别检查个人消息和台账读取，再运行 `python main.py`。个人模式不订阅机器人消息或启动长连接。
+6. `FEISHU_NOTIFY_CHAT_ID` 可选，不填则只回复原消息或提出人。个人模式下这些通知也使用授权用户身份。
 7. 仅在 `FEISHU_CREATE_DOCUMENTS=true` 时，需要额外的云文档创建、编辑和文件权限管理能力。
 
 配置 `FEISHU_LEDGER_URLS` 后，用 `python main.py --discover` 只读检查文件识别和所有数据表列表。App ID / Secret 来自飞书开放平台的应用凭据；网页查看权限与应用的数据权限是分开的。普通电子表格需要开启轮询；多维表格同时支持记录事件和轮询。
@@ -131,6 +131,8 @@ python main.py
 
 ```powershell
 python main.py --check           # 只检查本地配置与模板，不调用飞书或模型
+python main.py --login           # 浏览器授权个人飞书账号，首次使用需要
+python main.py --check-user      # 只读验证个人账号和消息读取，不发送消息
 python main.py --discover        # 访问飞书，只读列出文件内所有表；不启动队列或调用模型
 python main.py --list            # 查看已注册的 Agent
 python main.py --agents speaker  # 只运行指定 Agent
@@ -151,18 +153,18 @@ VS Code 解释器选择 `.venv/Scripts/python.exe`。源码、模板、文档和
 
 ## 使用
 
-- 台账状态改为“待生成方案”，等待事件触发或默认每 5 分钟补扫。
-- 发给机器人的私聊可直接描述，例如“月底财务总要一个个复制订单金额，给个按月份导出的入口呗”。不再要求固定关键词，也支持 `需求 具体描述` 和多行聊天转录。多表时根据消息中的工作表名称或带页签的文件链接选择目标，也可在首行写 `台账：PDF Viewer`；不明确时会请发送者带上目标后重发，不会任意选择第一张表。`SPEAKER_CHAT_TARGET` 可设置明确的默认目标；同名表需使用发现日志中的 `sheet/文件token/工作表ID` 或 `bitable/文件token/数据表ID`。
-- 群内先 @机器人，再直接描述需求。
-- 已有记录发送 `整理需求 记录ID或记录链接`，该记录仍需处于待处理状态。兼容原命令“生成方案”。
-- 发送“帮助”查看用法。问候、感谢等由模型识别为非需求时，只提示补充描述，不新建台账。
+- 首次先执行 `python main.py --login`，之后直接运行 `python main.py`。别人直接与你的个人账号聊天，无需添加机器人好友。
+- 别人直接私聊你的个人飞书账号：“PDF Viewer 增加按月份导出的入口，需要保留格式”。默认每 10 秒读取新消息，DeepSeek 整理需求并交给对应台账的工作流。
+- 多表时通过工作表名称、页签链接或首行 `台账：PDF Viewer` 选择目标；也可配置 `SPEAKER_CHAT_TARGET` 默认目标。不明确时保留需求并询问产品，对方 30 分钟内直接回复名称即可继续；“取消”结束当前待补充需求。
+- 普通闲聊静默跳过，不建档、不自动寒暄。短时间片段合并；建档之后的补充暂不自动合入旧需求。
+- 台账状态改为“待生成方案”，等待默认每 5 分钟轮询。个人模式不依赖台账事件长连接。
 
 ## 下层交接与返回
 
 完整交接说明见 [Speaker 交接协议](agents/speaker_agent/downstream/README.md)。
 
-1. Speaker 将需求快照写到 `runtime/handoff/outbox/<request_id>.json`。
-2. 下层需求分析 Agent 写 `runtime/handoff/inbox/<request_id>.analysis.json`，技术评审 Agent 写 `<request_id>.review.json`。两个 Agent 独立写文件，避免覆盖彼此结果。
+1. 个人模式的交接根目录为 `runtime/personal/<账号摘要>/handoff/`，Speaker 将需求快照写到其 `outbox/<request_id>.json`。
+2. 下层需求分析 Agent 写该目录下的 `inbox/<request_id>.analysis.json`，技术评审 Agent 写 `<request_id>.review.json`。两个 Agent 独立写文件，避免覆盖彼此结果。
 3. Speaker 每 5 秒检查等待中的任务，合并两类结果。只收到其中一类时继续等待。
 4. 收齐后，用 `agents/speaker_agent/templates/reply.md` 生成正文，回填对应台账记录，并回复原消息；无原消息时发送给提出人。
 
@@ -172,9 +174,9 @@ Speaker 的三个模板均在 `agents/speaker_agent/templates/`：`intake_prompt
 
 ## 当前边界
 
-- 本地部署：统一控制器为每个已注册 Agent 启动独立进程，当前只有 Speaker。每个来源表的持久队列、需求快照和回填/通知检查点保存在 `runtime/sources/<来源摘要>/speaker.sqlite3`，不同文件或工作表互不混用；下层交接仍统一使用 `runtime/handoff/`。同一运行目录只启动一个 Speaker 实例。
-- 当前支持文本会话和一张台账；不自动抓取任意人的历史聊天，不解析附件、图片或转发消息包。可把聊天内容复制到“需求”消息中。
-- 每条提交的消息独立整理，可在一条消息中粘贴多轮聊天；暂未自动合并会话前后文，也不把后续补充自动关联到旧需求。需要补充时可更新台账字段并重新触发。
+- 本地部署：统一控制器为每个已注册 Agent 启动独立进程，当前只有 Speaker。个人模式按账号隔离，在 `runtime/personal/<账号摘要>/` 保存消息收件箱、各来源队列及交接文件；同一运行目录只启动一个 Speaker 实例。
+- 支持多个台账文件和全部工作表；个人私聊支持文本及富文本中的文字，不解析附件、图片、语音和转发消息包。
+- 首次启动只接收此后新消息，重启后按持久化游标补读；过滤本人消息，按消息 ID 去重。合并同轮片段并保留台账选择的追问上下文，但建档后补充仍需更新台账再触发。
 - 下层结果必须带匹配的 `request_id`；需求内容或状态已变更时，旧结果不会回填。修改后把台账设回待处理状态以发起新一轮。
 - 通知失败单独重试，已成功的目标不重复投递。使用飞书的创建幂等键和消息 UUID；不宣称跨任意故障窗口绝对只投递一次。
 - 开启可选云文档时，远端创建成功但本地尚未记录文档 ID 就退出，仍可能产生重复文档。默认关闭云文档。

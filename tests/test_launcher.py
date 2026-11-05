@@ -95,7 +95,7 @@ class LauncherTests(unittest.TestCase):
             gateway.assert_not_called()
 
     def test_speaker_stops_worker_when_connection_is_interrupted(self):
-        config = replace(settings(self.root), enable_polling=False)
+        config = replace(settings(self.root), enable_polling=False, message_mode="bot")
         agent = Mock()
         agent.tables = {}
         connection = Mock()

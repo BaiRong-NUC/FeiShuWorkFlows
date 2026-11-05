@@ -4,7 +4,9 @@ Speaker 只负责需求整理和对外回复；业务分析、技术可行性、
 
 ## 需求输入
 
-`runtime/handoff/outbox/<request_id>.json` 使用 UTF-8，每个文件是一轮不可变的需求快照：
+个人模式的交接根目录是 `runtime/personal/<账号摘要>/handoff/`，启动日志会显示具体位置；机器人模式的根目录仍是 `runtime/handoff/`。下层应使用对应账号的目录，避免跨账号投递结果。
+
+交接根目录下的 `outbox/<request_id>.json` 使用 UTF-8，每个文件是一轮不可变的需求快照：
 
 ```json
 {

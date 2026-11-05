@@ -62,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--check", action="store_true", help="仅检查依赖、配置和模板，不连接飞书或大模型")
     mode.add_argument("--list", action="store_true", help="列出已实现并注册的 Agent")
     mode.add_argument("--discover", action="store_true", help="只读发现台账文件中的所有表，不启动业务处理")
+    mode.add_argument("--login", action="store_true", help="授权个人飞书账号")
+    mode.add_argument("--check-user", action="store_true", help="只读检查个人飞书接入，不发送消息或写入台账")
     parser.add_argument("--agents", nargs="+", choices=[agent.name for agent in AGENTS], help="只启动指定的 Agent")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -75,12 +77,13 @@ def main(argv: list[str] | None = None) -> int:
     selected = tuple(agent for agent in AGENTS if not args.agents or agent.name in args.agents)
     python = project_python(ROOT)
     try:
-        if args.check or args.discover:
+        if args.check or args.discover or args.login or args.check_user:
             if not python.is_file():
                 LOGGER.error("缺少 .venv，请先运行 python main.py --setup")
                 return 2
-            if args.discover:
-                return subprocess.run([str(python), "-m", "agents.speaker_agent.main", "--discover"],
+            if args.discover or args.login or args.check_user:
+                action = "--login" if args.login else "--check-user" if args.check_user else "--discover"
+                return subprocess.run([str(python), "-m", "agents.speaker_agent.main", action],
                                       cwd=ROOT, env={**os.environ, "PYTHONUTF8": "1"}, check=False).returncode
             if not check_agents(ROOT, python, selected):
                 return 2

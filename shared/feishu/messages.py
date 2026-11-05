@@ -11,11 +11,14 @@ from lark_oapi.api.im.v1 import (
 )
 
 from shared.feishu.errors import require_service, required_data
+from shared.feishu.auth.oauth import AccessTokenProvider
+from shared.feishu.personal import user_options
 
 
 class MessageClient:
-    def __init__(self, client: lark.Client) -> None:
+    def __init__(self, client: lark.Client, *, user_tokens: AccessTokenProvider | None = None) -> None:
         self.client = client
+        self.user_tokens = user_tokens
 
     def send_text(self, receive_id_type: str, receive_id: str, text: str, *, uuid: str = "") -> None:
         body = (
@@ -32,7 +35,8 @@ class MessageClient:
             .request_body(body)
             .build()
         )
-        response = require_service(self.client.im).v1.message.create(request)
+        response = require_service(self.client.im).v1.message.create(
+            request, user_options(request, self.user_tokens) if self.user_tokens else lark.RequestOption())
         required_data(response, "send Feishu message")
 
     def reply_text(self, message_id: str, text: str, *, uuid: str = "") -> None:
@@ -46,5 +50,6 @@ class MessageClient:
         request = (
             ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
         )
-        response = require_service(self.client.im).v1.message.reply(request)
+        response = require_service(self.client.im).v1.message.reply(
+            request, user_options(request, self.user_tokens) if self.user_tokens else lark.RequestOption())
         required_data(response, "reply to Feishu message")

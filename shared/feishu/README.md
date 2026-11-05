@@ -10,6 +10,8 @@
 | `catalog.py` | 从文件链接识别类型、解析知识库节点、枚举电子表格工作表和多维表格数据表 |
 | `sheets.py` | 普通电子表格的单元格读取、批量写入和追加行；复用 SDK 鉴权 |
 | `messages.py` | 发送、回复文本；保留消息 UUID 幂等参数 |
+| `auth/` | OAuth 登录、PKCE/state 校验、用户 Token 刷新及 Windows DPAPI 加密存储 |
+| `personal.py` | 用户身份枚举个人单聊、分页读消息及提取文本；`PersonalChatAPI` 和 Token Provider 接口 |
 | `documents.py` | 创建 Markdown 云文档、转换和写入内容、授予查看权限 |
 | `connection.py` | 构造事件分发器和长连接客户端，调用方决定订阅与启动时机 |
 | `events.py`、`fields.py` | 解析事件字段、处理提及标记、提取字段文本和人员 ID |
@@ -31,6 +33,10 @@ table = feishu.table(BitableConfig(app_token="你的表格应用Token", table_id
 ```
 
 一个客户端可以创建多个表格服务，每个表格对象独立保存地址和字段缓存；调用方应复用该对象。字段值保持原始结构，不自动压缩多行原文。应用凭据、表格地址可直接构造配置对象，无需依赖 Speaker 的配置类。
+
+`FeishuClient(config, user_tokens=oauth)` 将消息发送/回复绑定到用户身份；表格和云文档仍使用应用身份。个人消息请求显式限定 `AccessTokenType.USER`，不会在授权失败时降级为机器人。`PersonalChatClient(feishu.client, oauth)` 负责用户会话读取；传入自建 SDK Client 时需启用 `enable_set_token(True)`。消息分页和权限错误会抛出异常，不将不完整分页当作成功。
+
+授权文件保存在调用方指定的 `runtime/auth/feishu-user.dat`，与应用绑定；Windows 用当前用户 DPAPI 加密，其他系统使用权限为 0600 的原子文件。刷新期间持有线程锁和进程锁，旋转前记录状态；断网或崩溃导致结果不确定时要求重新授权，不重复消费一次性刷新凭据。SDK 及 OAuth 请求超时为 30 秒；不记录凭据或 OAuth 错误响应正文。
 
 Speaker 自己的网关负责将通用记录转换成需求模型、选择业务列、决定完成状态和链接文案；事件适配器负责选择目标台账、判断状态变化和群聊触发条件。回复模板仍放在 `agents/speaker_agent/templates/`。
 

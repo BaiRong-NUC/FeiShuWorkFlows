@@ -63,6 +63,8 @@ class Settings:
     source_kind: str = "bitable"
     sheet_id_field: str = "ID"
     sheet_note_field: str = "Agent备注"
+    message_mode: str = "personal"
+    personal_poll_seconds: int = 10
 
     @property
     def feishu(self) -> FeishuConfig:
@@ -122,9 +124,17 @@ class Settings:
             chat_target=_value("SPEAKER_CHAT_TARGET"),
             sheet_id_field=_value("FEISHU_SHEETS_ID_FIELD", "ID"),
             sheet_note_field=_value("FEISHU_SHEETS_NOTE_FIELD", "Agent备注"),
+            message_mode=_value("FEISHU_MESSAGE_MODE", "personal").lower(),
+            personal_poll_seconds=int(_value("FEISHU_PERSONAL_POLL_SECONDS", "10")),
         )
 
     def validate_for_startup(self) -> None:
+        if self.message_mode not in {"personal", "bot"}:
+            raise ConfigError("FEISHU_MESSAGE_MODE 必须是 personal 或 bot")
+        if not 5 <= self.personal_poll_seconds <= 300:
+            raise ConfigError("FEISHU_PERSONAL_POLL_SECONDS 须在 5–300 秒之间")
+        if self.message_mode == "personal" and not self.enable_polling:
+            raise ConfigError("个人模式通过轮询读取台账，请设置 FEISHU_ENABLE_POLLING=true")
         for url in self.ledger_urls:
             parse_file_url(url)
         if not self.ledger_urls:
