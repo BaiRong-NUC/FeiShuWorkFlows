@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Protocol
 
 from agents.speaker_agent.domain.contracts import DownstreamResult, RequirementBrief, result_from_dict
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DownstreamAgent(Protocol):
@@ -50,6 +53,7 @@ class FileDownstreamAgent(DownstreamAgent):
             temporary = path.with_suffix(".tmp")
             temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(temporary, path)
+            LOGGER.info("已写入下层交接：请求=%s，类型=%s", brief.request_id, brief.task_type)
         merged = {}
         for suffix in (".json", ".analysis.json", ".review.json"):
             result_path = self.inbox / f"{brief.request_id}{suffix}"

@@ -107,6 +107,35 @@ class SemanticIntakeTests(unittest.TestCase):
         self.assertEqual(len(self.client.calls), 1)
         self.assertEqual(len(self.gateway.created), 1)
 
+    def test_inquiry_file_result_and_failed_delivery_resume_with_same_uuid(self):
+        question = IntakeDecision(False, title="当前广告策略", requirements="请说明当前广告策略", is_inquiry=True)
+        self.client.content = json.dumps(asdict(question), ensure_ascii=False)
+        with patch.object(self.gateway, "get_record", side_effect=AssertionError("咨询不读取台账")):
+            self.assertTrue(required(self.agent.process_item(self.receive("PDFViewer 的广告策略是什么？"))).ok)
+        job = self.agent.workflows.unfinished_jobs()[0]
+        answer = "当前配置尚缺，请提供配置后由下层确认。"
+        path = self.root / "handoff/inbox" / f'{job["id"]}.analysis.json'
+        path.write_text(json.dumps({"schema_version": 1, "request_id": job["id"],
+                                    "result": {"analysis": {"summary": answer}, "notes": ["仅内部备注"]}},
+                                   ensure_ascii=False), encoding="utf-8")
+        with patch.object(self.gateway, "reply_text", side_effect=RuntimeError("回复暂不可用")) as failed:
+            with self.assertLogs("agents.speaker_agent.orchestration.service", level="ERROR"):
+                self.agent.resume_pending()
+        self.assertEqual(required(self.agent.workflows.get_job(job["id"]))["state"], "publishing")
+        unused_client = FakeCompletion(error=ModelError("重启不应重新识别"))
+        restarted = self.make_agent(unused_client)
+        with patch.object(self.gateway, "reply_text") as reply:
+            restarted.resume_pending()
+            reply.assert_called_once_with(*failed.call_args.args, **failed.call_args.kwargs)
+            self.assertIn(answer, reply.call_args.args[1])
+            self.assertNotIn("仅内部备注", reply.call_args.args[1])
+        self.assertFalse(restarted.workflows.unfinished_jobs())
+        self.assertEqual(self.gateway.created, [])
+        self.assertEqual(self.gateway.results, [])
+        self.assertEqual(self.gateway.statuses, [])
+        self.assertEqual(self.gateway.documents, [])
+        self.assertEqual(unused_client.calls, [])
+
     def test_ledger_edits_invalidate_old_result_and_override_cached_draft(self):
         self.agent.process_item(self.receive())
         old_job = required(self.agent.workflows.latest_job("rec-created"))

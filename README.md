@@ -155,7 +155,8 @@ VS Code 解释器选择 `.venv/Scripts/python.exe`。源码、模板、文档和
 
 - 首次先执行 `python main.py --login`，之后直接运行 `python main.py`。别人直接与你的个人账号聊天，无需添加机器人好友。
 - 别人直接私聊你的个人飞书账号：“PDF Viewer 增加按月份导出的入口，需要保留格式”。默认每 10 秒读取新消息，DeepSeek 整理需求并交给对应台账的工作流。
-- 多表时通过工作表名称、页签链接或首行 `台账：PDF Viewer` 选择目标；也可配置 `SPEAKER_CHAT_TARGET` 默认目标。不明确时保留需求并询问产品，对方 30 分钟内直接回复名称即可继续；“取消”结束当前待补充需求。
+- 多表时通过工作表名称、页签链接或首行 `台账：PDF Viewer` 选择目标。`PDFViewer`、`pdf-viewer` 与 `PDF Viewer` 等价；较长英文项目名的小幅拼写错误仅在唯一明确匹配时接受，多项目或同名表仍追问。也可配置 `SPEAKER_CHAT_TARGET` 默认目标。不明确时保留消息并询问项目，对方 30 分钟内直接回复名称即可继续；“取消”结束当前待补充任务。
+- “PDFViewer 的广告策略是什么？”等业务询问属于咨询，会保留问题并交给下层分析，不新建变更需求行。下层返回 `analysis.summary` 后即可按咨询模板回复，无需等待技术评审；“广告缓存冷却改成15s”等变更请求仍走需求建档、分析与评审流程。
 - 普通闲聊、问候或感谢统一回复“本人不在，普通聊天 DeepSeek 暂时不回复。”，不创建需求；文案在 `agents/speaker_agent/templates/away.md`，修改后重启生效。DeepSeek 仍用于需求识别，闲聊回复使用固定模板。短时间片段合并；建档之后的补充暂不自动合入旧需求。
 - 台账状态改为“待生成方案”，等待默认每 5 分钟轮询。个人模式不依赖台账事件长连接。
 
@@ -168,7 +169,7 @@ VS Code 解释器选择 `.venv/Scripts/python.exe`。源码、模板、文档和
 3. Speaker 每 5 秒检查等待中的任务，合并两类结果。只收到其中一类时继续等待。
 4. 收齐后，用 `agents/speaker_agent/templates/reply.md` 生成正文，回填对应台账记录，并回复原消息；无原消息时发送给提出人。
 
-Speaker 的三个模板均在 `agents/speaker_agent/templates/`：`intake_prompt.md` 约束模型的需求理解职责，`requirement.md` 控制整理后的需求单格式，`reply.md` 控制下层结果的对外回复格式。
+Speaker 的模板均在 `agents/speaker_agent/templates/`：`intake_prompt.md` 约束需求、咨询和闲聊识别，`requirement.md` 控制需求单格式，`reply.md` 控制需求分析与评审的回复格式，`inquiry_reply.md` 控制咨询答复，`away.md` 控制普通闲聊的固定回复。
 
 需求单和回复模板使用 `${title}` 等具名占位符。可修改内容、顺序和标题，或通过 `SPEAKER_REPLY_TEMPLATE` 指定其他回复模板；修改后重启生效。聊天和台账当前保存/发送 Markdown 文本，飞书纯文本消息不保证显示 Markdown 富文本效果。
 

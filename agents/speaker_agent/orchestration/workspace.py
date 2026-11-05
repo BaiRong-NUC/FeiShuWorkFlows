@@ -17,6 +17,7 @@ from agents.speaker_agent.adapters.feishu.sheets_gateway import SheetGateway
 from agents.speaker_agent.config import Settings
 from agents.speaker_agent.domain.ports import DemandGateway
 from agents.speaker_agent.downstream.bridge import FileDownstreamAgent
+from agents.speaker_agent.intake.routing import match_projects
 from agents.speaker_agent.orchestration.service import DemandAgent
 from shared.feishu.catalog import TableReference
 from shared.feishu.client import FeishuClient
@@ -124,11 +125,11 @@ class SpeakerWorkspace:
         explicit = re.match(r"^台账\s*[:：]\s*([^\n]+)\n?(.*)$", text.strip(), re.S)
         target = explicit[1].strip() if explicit else ""
         if explicit:
-            candidates = [ref for ref in refs if target in {ref.title, ref.key}]
+            candidates = [ref for ref in refs if target == ref.key] or match_projects(target, refs, exact=True)
         else:
             candidates = self._link_targets(text, refs)
             if not candidates:
-                candidates = [ref for ref in refs if ref.title.casefold() in text.casefold()]
+                candidates = match_projects(text, refs)
             if not candidates and use_default and self.settings.chat_target:
                 candidates = [ref for ref in refs if self.settings.chat_target in {ref.title, ref.key}]
             if not candidates and use_default and len(refs) == 1:

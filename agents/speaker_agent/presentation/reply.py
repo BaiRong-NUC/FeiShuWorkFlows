@@ -17,6 +17,19 @@ class ReplyFormatter:
             "title", "analysis_summary", "recommended_plan", "effort_and_dependencies",
             "risks_and_questions", "next_actions", "record_url", "request_id",
         )})
+        inquiry_path = Path(__file__).resolve().parents[1] / "templates" / "inquiry_reply.md"
+        self.inquiry_template = Template(inquiry_path.read_text(encoding="utf-8-sig"))
+        self.inquiry_template.substitute(title="", answer="", questions="")
+
+    def inquiry(self, brief: RequirementBrief, result: DownstreamResult) -> str:
+        if result.analysis is None:
+            raise ValueError("咨询答复必须来自下层分析")
+        return self.inquiry_template.substitute(
+            title=_sentence(brief.title), answer=result.analysis.summary.strip(),
+            questions="\n".join(f"- {item}" for item in _unique([
+                *result.analysis.risks, *result.analysis.open_questions,
+            ])) or "下层未提供待确认项。",
+        ).strip() + "\n"
 
     def render(self, brief: RequirementBrief, downstream: DownstreamResult) -> str:
         analysis = downstream.analysis

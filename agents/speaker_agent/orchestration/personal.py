@@ -61,7 +61,8 @@ class PersonalIntake:
                     decision = (self.interpreter.interpret(demand.text) if self.interpreter else
                                 IntakeDecision(True, title=demand.text.splitlines()[0][:100], requirements=demand.text))
                     batch["decision"] = asdict(parse_intake_decision(asdict(decision)))
-                    LOGGER.info("个人消息识别完成：消息=%s，是否需求=%s", demand.message_id, decision.is_requirement)
+                    LOGGER.info("个人消息识别完成：消息=%s，是否需求=%s，是否咨询=%s",
+                                demand.message_id, decision.is_requirement, decision.is_inquiry)
                 except ModelError as exc:
                     if exc.retryable and batch["attempts"] < 3:
                         raise
@@ -69,7 +70,7 @@ class PersonalIntake:
         self.inbox.save(batch)
         if batch["decision"] and not batch["reply"]:
             decision = parse_intake_decision(batch["decision"])
-            if not decision.is_requirement:
+            if not decision.needs_analysis:
                 batch["reply"] = self.away_reply
                 batch["context"] = ""
                 self.inbox.save(batch)
@@ -79,9 +80,9 @@ class PersonalIntake:
                     batch["target"] = target
                 else:
                     batch["context"] = demand.text
-                    batch["reply"] = "这项需求属于哪个台账？请直接回复名称：" + self.workspace.table_names() + "。"
+                    batch["reply"] = "这条消息对应哪个项目？请直接回复名称：" + self.workspace.table_names() + "。"
                 self.inbox.save(batch)
-            if decision.is_requirement and batch["target"]:
+            if decision.needs_analysis and batch["target"]:
                 agent = self.workspace.agent_for(batch["target"])
                 if agent is None:
                     raise RuntimeError("需求目标表暂不可用，保留原交接目标")
@@ -89,7 +90,8 @@ class PersonalIntake:
                     agent.workflows.save_intake(demand.message_id, {"source": asdict(demand), "attempts": 1,
                                                                  "reply_uuid": uuid, "decision": batch["decision"]})
                 agent.accept_message(demand)
-                LOGGER.info("个人需求已交接：消息=%s，台账=%s", demand.message_id, agent.settings.source_table)
+                LOGGER.info("个人消息已进入处理队列：消息=%s，项目=%s，类型=%s",
+                            demand.message_id, agent.settings.source_table, "咨询" if decision.is_inquiry else "需求")
         if batch["reply"]:
             self.workspace.feishu.messages.reply_text(demand.message_id, batch["reply"], uuid=uuid)
             LOGGER.info("个人消息已回复：消息=%s", demand.message_id)

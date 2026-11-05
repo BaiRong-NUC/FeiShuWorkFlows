@@ -26,6 +26,8 @@ class RequirementBrief:
     source_chat_id: str = ""
     request_id: str = ""
     clarification_questions: tuple[str, ...] = ()
+    task_type: str = "requirement"
+    project: str = ""
 
 
 @dataclass(frozen=True)

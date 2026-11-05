@@ -21,6 +21,7 @@ from lark_oapi.core.token.auth import verify
 from agents.speaker_agent import main as speaker
 from agents.speaker_agent.adapters.feishu.personal import PersonalPoller
 from agents.speaker_agent.domain.intake import IntakeDecision
+from agents.speaker_agent.domain.contracts import AnalysisResult, DownstreamResult
 from agents.speaker_agent.orchestration.personal import PersonalIntake
 from agents.speaker_agent.orchestration.workspace import SpeakerWorkspace
 from agents.speaker_agent.persistence.personal import PersonalInbox
@@ -291,7 +292,7 @@ class PersonalIntakeTests(unittest.TestCase):
     def test_missing_product_keeps_context_for_next_answer(self):
         self.stage("original", "增加导出，保留格式")
         self.intake.process(self.inbox.pending(120)[0])
-        self.assertIn("哪个台账", self.api.replies[0][1])
+        self.assertIn("哪个项目", self.api.replies[0][1])
         self.stage("answer", "产品乙", int(time.time() * 1000) - 10000)
         batch = self.inbox.pending(time.time())[0]
         self.assertIn("增加导出", batch["source"]["text"])
@@ -315,6 +316,61 @@ class PersonalIntakeTests(unittest.TestCase):
                     self.assertTrue(reply.call_args.kwargs["uuid"])
                     self.assertEqual(reply.call_args, failed.call_args)
                 self.model.interpret.assert_called_once()
+
+    def test_business_question_hands_off_without_ledger_and_only_waits_for_analysis(self):
+        self.api.refs[0] = replace(self.api.refs[0], title="PDF Viewer")
+        self.workspace = SpeakerWorkspace(replace(settings(self.root), notify_chat_id=""), feishu=self.api)
+        for agent in self.workspace.agents.values():
+            agent.interpreter = self.model
+        self.intake = PersonalIntake(self.workspace, self.inbox, interpreter=self.model)
+        question = "PDFViewwe哪里你的广告策略是什么？"
+        self.model.interpret.return_value = IntakeDecision(False, title="了解广告策略", requirements=question, is_inquiry=True)
+        self.stage("inquiry", question)
+        self.intake.process(self.inbox.pending(120)[0])
+        agent = self.workspace.agents[self.api.refs[0].key]
+        self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+        self.assertEqual(self.api.writes, [])
+        self.assertEqual(len(self.api.rows["one"]), 3)
+        self.assertEqual(len(self.api.replies), 1)
+        self.assertIn("交给下层分析", self.api.replies[0][1])
+        self.assertNotIn("哪个项目", self.api.replies[0][1])
+        path = next((self.root / "handoff/outbox").glob("*.json"))
+        handoff = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(handoff["brief"]["task_type"], "inquiry")
+        self.assertEqual(handoff["brief"]["project"], "PDF Viewer")
+        self.assertEqual(handoff["brief"]["raw_text"], question)
+        self.assertEqual(handoff["brief"]["missing_fields"], [])
+        restarted = SpeakerWorkspace(replace(settings(self.root), notify_chat_id=""), feishu=self.api)
+        agent = restarted.agents[self.api.refs[0].key]
+        agent.resume_pending()
+        self.assertEqual(len(self.api.replies), 1)
+        answer = "下层核实结果：需要提供当前版本的广告配置才能确认。"
+        result = DownstreamResult(analysis=AnalysisResult(answer, open_questions=("请提供版本号",)))
+        agent.submit_result(handoff["request_id"], result)
+        self.assertIn(answer, self.api.replies[-1][1])
+        self.assertNotIn("技术评审", self.api.replies[-1][1])
+        self.assertFalse(agent.workflows.unfinished_jobs())
+        agent.submit_result(handoff["request_id"], result)
+        self.assertEqual(len(self.api.replies), 2)
+        self.assertEqual(self.api.writes, [])
+        self.model.interpret.assert_called_once()
+
+    def test_explicit_compact_project_name_creates_requirement_without_clarification(self):
+        self.api.refs[0] = replace(self.api.refs[0], title="PDF Viewer")
+        self.workspace = SpeakerWorkspace(replace(settings(self.root), notify_chat_id=""), feishu=self.api)
+        for agent in self.workspace.agents.values():
+            agent.interpreter = self.model
+        self.intake = PersonalIntake(self.workspace, self.inbox, interpreter=self.model)
+        self.model.interpret.return_value = IntakeDecision(True, title="广告缓存冷却改为15s", requirements="广告缓存冷却改为15s")
+        self.stage("change", "PDFViewer 哪里广告缓存冷却改成15s")
+        self.intake.process(self.inbox.pending(120)[0])
+        self.assertEqual(self.api.replies, [])
+        agent = self.workspace.agents[self.api.refs[0].key]
+        self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+        self.assertEqual(len(self.api.rows["one"]), 4)
+        self.assertEqual(len(self.api.rows["two"]), 3)
+        self.assertIn("建档", self.api.replies[0][1])
+        self.assertNotIn("哪个项目", self.api.replies[0][1])
 
     def test_model_failures_retry_at_most_three_times_across_restart(self):
         self.stage("failed", "产品甲增加导出")

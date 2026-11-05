@@ -109,7 +109,7 @@ class DemandAgent:
             except Exception as exc:
                 # Preserve both inbox work and the created-record mapping for retry.
                 self.workflows.defer_work(item.key)
-                LOGGER.exception("Speaker intake/delivery failed: %s", item.key)
+                LOGGER.exception("Speaker 处理暂未完成，任务已保留，30 秒后重试：%s", item.key)
                 return ProcessingResult(item.record_id, False, "", error=str(exc))
 
     def resume_pending(self) -> None:
@@ -169,6 +169,8 @@ class DemandAgent:
             draft = self._message_draft(demand)
             if draft is None:
                 return None
+            if draft.task_type == "inquiry":
+                return self._inquiry_job(draft, demand)
             token, record_id = self.workflows.creation(demand.message_id)
             if not record_id:
                 fields = self.normalizer.ledger_fields(draft)
@@ -243,15 +245,55 @@ class DemandAgent:
             self.gateway.reply_text(demand.message_id, "需求整理暂未成功，尚未新建台账。请检查模型配置或缩短内容后重新发送。", uuid=cached["reply_uuid"])
             return None
         decision = parse_intake_decision(cached["decision"])
-        if not decision.is_requirement:
+        if not decision.needs_analysis:
             self.gateway.reply_text(demand.message_id, "暂未识别到具体需求。可以描述想改进的事情或遇到的问题，我会整理成需求单。", uuid=cached["reply_uuid"])
             return None
         return self.normalizer.from_decision(demand, decision)
+
+    def _inquiry_job(self, brief: RequirementBrief, demand: IncomingDemand) -> dict:
+        # 咨询独立持久化并走同一个下层交接队列，不写成变更需求行。
+        request_id = "inquiry_" + hashlib.sha256(demand.message_id.encode()).hexdigest()[:32]
+        previous = self.workflows.get_job(request_id)
+        if previous:
+            return previous
+        brief = replace(brief, request_id=request_id, project=self.settings.source_table,
+                        source=brief.source + " / " + self.settings.source_table)
+        job = {"id": request_id, "brief": asdict(brief), "reply_to": demand.message_id,
+               "state": "waiting", "result": {}, "acknowledged": False, "delivery": {},
+               "document_url": ""}
+        self.workflows.save_job(job)
+        return job
+
+    def _advance_inquiry(self, job: dict, brief: RequirementBrief) -> ProcessingResult:
+        result = result_from_dict(job["result"])
+        if result.analysis is None:
+            returned = self.downstream.evaluate(brief)
+            if returned is not None:
+                self._merge(job, result_from_dict(asdict(returned)))
+                result = result_from_dict(job["result"])
+        if result.analysis is None:
+            reply = f"已接收关于「{brief.project}」的咨询《{brief.title}》，已交给下层分析，结果返回后回复。"
+            if not job["acknowledged"]:
+                self._notify(job, reply, phase="ack")
+                job["acknowledged"] = True
+                self.workflows.save_job(job)
+            return ProcessingResult("", True, reply)
+        if "markdown" not in job:
+            job["markdown"] = self.formatter.inquiry(brief, result)
+            job["state"] = "publishing"
+            self.workflows.save_job(job)
+        self._notify(job, job["markdown"], phase="result")
+        job["state"] = "done"
+        job.pop("last_error", None)
+        self.workflows.save_job(job)
+        return ProcessingResult("", True, job["markdown"])
 
     def _advance(self, job: dict) -> ProcessingResult:
         brief = RequirementBrief(**job["brief"])
         if job["state"] == "done":
             return ProcessingResult(brief.record_id, True, job["markdown"], job["document_url"])
+        if brief.task_type == "inquiry":
+            return self._advance_inquiry(job, brief)
         self._validate_current(job)
         result = result_from_dict(job["result"])
         if not result.complete:
@@ -369,7 +411,8 @@ class DemandAgent:
 
 def _fingerprint(brief: RequirementBrief) -> str:
     fields = asdict(brief)
-    for key in ("source", "source_message_id", "source_chat_id", "request_id", "record_url", "clarification_questions"):
+    for key in ("source", "source_message_id", "source_chat_id", "request_id", "record_url", "clarification_questions",
+                "task_type", "project"):
         fields.pop(key, None)
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 

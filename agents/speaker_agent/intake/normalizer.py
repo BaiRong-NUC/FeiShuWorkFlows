@@ -53,6 +53,7 @@ class RequirementNormalizer:
             links=_text(fields.get("相关链接")),
             record_url=record.record_url,
             raw_text=raw_text,
+            project=self.settings.source_table,
         )
         if parsed:
             brief = replace(brief, **{
@@ -87,6 +88,7 @@ class RequirementNormalizer:
             raw_text=demand.text,
             source_message_id=demand.message_id,
             source_chat_id=demand.chat_id,
+            project=self.settings.source_table,
         )
         return replace(brief, missing_fields=_missing(brief))
 
@@ -108,11 +110,14 @@ class RequirementNormalizer:
             self.from_message(demand),
             **{name: getattr(decision, name) for name in TEXT_FIELDS},
             clarification_questions=decision.clarification_questions,
+            task_type="inquiry" if decision.is_inquiry else "requirement",
         )
         return replace(brief, missing_fields=_missing(brief))
 
 
 def _missing(brief: RequirementBrief) -> tuple[str, ...]:
+    if brief.task_type == "inquiry":
+        return ()
     required = {
         "业务目标": brief.goal,
         "功能要求": brief.requirements,
