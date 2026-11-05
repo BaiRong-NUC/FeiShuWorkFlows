@@ -47,6 +47,8 @@ def check_configuration(*, for_discovery: bool = False) -> Settings:
         return settings
     ReplyFormatter(settings.reply_template)
     BriefFormatter()
+    if settings.message_mode == "personal":
+        PersonalIntake.load_away_reply()
     if settings.intake_mode == "deepseek":
         prompt = Path(__file__).parent / "templates" / "intake_prompt.md"
         if not prompt.read_text(encoding="utf-8-sig").strip():

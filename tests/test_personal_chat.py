@@ -266,12 +266,15 @@ class PersonalIntakeTests(unittest.TestCase):
         self.assertTrue(any(mid == "two" for mid, _ in self.api.replies))
         self.assertFalse(self.inbox.pending(130))
 
-    def test_greeting_is_silent_and_does_not_create_or_reply(self):
+    def test_greeting_sends_away_reply_without_creating_requirement(self):
         self.model.interpret.return_value = IntakeDecision(False)
         self.stage("greeting", "你好")
         self.intake.process(self.inbox.pending(120)[0])
-        self.assertFalse(self.api.replies)
+        self.assertEqual(self.api.replies, [("greeting", "本人不在，普通聊天 DeepSeek 暂时不回复。")])
         self.assertTrue(all(agent._next_item() is None for agent in self.workspace.agents.values()))
+        self.assertEqual(self.api.writes, [])
+        self.stage("greeting", "你好")
+        self.assertFalse(self.inbox.pending(130))
 
     def test_missing_product_keeps_context_for_next_answer(self):
         self.stage("original", "增加导出，保留格式")
@@ -285,16 +288,21 @@ class PersonalIntakeTests(unittest.TestCase):
         self.assertIsNotNone(self.workspace.agents[self.api.refs[1].key]._next_item())
 
     def test_failed_reply_reuses_cached_decision_and_stable_message_uuid(self):
-        self.stage("unknown", "增加导出")
-        batch = self.inbox.pending(120)[0]
-        with patch.object(self.api, "reply_text", side_effect=RuntimeError("暂不可用")):
-            with self.assertRaises(RuntimeError):
-                self.intake.process(batch)
-        recovered = self.inbox.pending(130)[0]
-        with patch.object(self.api, "reply_text") as reply:
-            self.intake.process(recovered)
-            self.assertTrue(reply.call_args.kwargs["uuid"])
-        self.model.interpret.assert_called_once()
+        for is_requirement in (True, False):
+            with self.subTest(is_requirement=is_requirement):
+                self.model.reset_mock()
+                self.model.interpret.return_value = IntakeDecision(is_requirement, title="导出" if is_requirement else "")
+                self.stage(f"unknown-{is_requirement}", "增加导出" if is_requirement else "谢谢")
+                batch = self.inbox.pending(120)[0]
+                with patch.object(self.api, "reply_text", side_effect=RuntimeError("暂不可用")) as failed:
+                    with self.assertRaises(RuntimeError):
+                        self.intake.process(batch)
+                recovered = PersonalInbox(self.inbox.path, 999999).pending(130)[0]
+                with patch.object(self.api, "reply_text") as reply:
+                    self.intake.process(recovered)
+                    self.assertTrue(reply.call_args.kwargs["uuid"])
+                    self.assertEqual(reply.call_args, failed.call_args)
+                self.model.interpret.assert_called_once()
 
     def test_model_failures_retry_at_most_three_times_across_restart(self):
         self.stage("failed", "产品甲增加导出")

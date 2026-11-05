@@ -4,6 +4,7 @@ import hashlib
 import logging
 import time
 from dataclasses import asdict
+from pathlib import Path
 
 from agents.speaker_agent.domain.intake import DemandInterpreter, IntakeDecision, parse_intake_decision
 from agents.speaker_agent.domain.models import IncomingDemand
@@ -20,10 +21,18 @@ class PersonalIntake:
     def __init__(self, workspace: SpeakerWorkspace, inbox: PersonalInbox, *,
                  interpreter: DemandInterpreter | None = None) -> None:
         self.workspace, self.inbox = workspace, inbox
+        self.away_reply = self.load_away_reply()
         self.interpreter = interpreter
         if interpreter is None and workspace.settings.intake_mode == "deepseek":
             self.interpreter = ModelDemandInterpreter(DeepSeekClient(workspace.settings.deepseek),
                                                      max_chars=workspace.settings.intake_max_chars)
+
+    @staticmethod
+    def load_away_reply() -> str:
+        text = (Path(__file__).resolve().parents[1] / "templates" / "away.md").read_text(encoding="utf-8-sig").strip()
+        if not text:
+            raise ValueError("Speaker 普通聊天回复模板不能为空")
+        return text
 
     def drain(self) -> None:
         for batch in self.inbox.pending(time.time()):
@@ -59,10 +68,10 @@ class PersonalIntake:
         if batch["decision"] and not batch["reply"]:
             decision = parse_intake_decision(batch["decision"])
             if not decision.is_requirement:
-                # 对个人账号的普通寒暄不自动回复，也不创建台账。
-                self.inbox.finish(batch, time.time())
-                return
-            if not batch["target"]:
+                batch["reply"] = self.away_reply
+                batch["context"] = ""
+                self.inbox.save(batch)
+            elif not batch["target"]:
                 target = self.workspace.select_target(batch["latest_text"], use_default=False) or self.workspace.select_target(demand.text)
                 if target:
                     batch["target"] = target
@@ -70,7 +79,7 @@ class PersonalIntake:
                     batch["context"] = demand.text
                     batch["reply"] = "这项需求属于哪个台账？请直接回复名称：" + self.workspace.table_names() + "。"
                 self.inbox.save(batch)
-            if batch["target"]:
+            if decision.is_requirement and batch["target"]:
                 agent = self.workspace.agent_for(batch["target"])
                 if agent is None:
                     raise RuntimeError("需求目标表暂不可用，保留原交接目标")
