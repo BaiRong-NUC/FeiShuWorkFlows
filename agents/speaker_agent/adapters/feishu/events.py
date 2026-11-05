@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import json
 import logging
 
 import lark_oapi as lark
 from lark_oapi.event.dispatcher_handler import EventDispatcherHandlerBuilder
 
 from agents.speaker_agent.orchestration.service import DemandAgent
+from shared.feishu.events import bot_mentioned, event_field_text, parse_text_content, strip_mentions
 
 
 LOGGER = logging.getLogger(__name__)
@@ -58,16 +58,13 @@ def on_message(agent: DemandAgent, data: lark.im.v1.P2ImMessageReceiveV1) -> Non
     sender = getattr(event, "sender", None)
     if getattr(sender, "sender_type", "user") != "user":
         return
-    if message.chat_type == "group" and not _bot_mentioned(message.mentions, agent.settings.bot_open_id):
+    if message.chat_type == "group" and not bot_mentioned(message.mentions, agent.settings.bot_open_id):
         return
-    try:
-        payload = json.loads(message.content)
-    except json.JSONDecodeError:
-        LOGGER.warning("ignored non-JSON Feishu text message %s", message.message_id)
+    content = parse_text_content(message.content)
+    if content is None:
+        LOGGER.warning("ignored invalid Feishu text message %s", message.message_id)
         return
-    if not isinstance(payload, dict) or not isinstance(payload.get("text"), str):
-        return
-    text = _strip_mentions(payload["text"], message.mentions, agent.settings.bot_open_id)
+    text = strip_mentions(content, message.mentions, agent.settings.bot_open_id)
     sender_id = str(getattr(getattr(sender, "sender_id", None), "open_id", "") or "")
     agent.handle_command(text, message.message_id, sender_id, getattr(message, "chat_id", ""))
 
@@ -94,47 +91,5 @@ def _status_values(fields: object, status_field_id: str) -> set[str]:
         raw_value = getattr(field, "field_value", None)
         if raw_value is None:
             continue
-        values.add(_field_text(raw_value))
+        values.add(event_field_text(raw_value))
     return {value for value in values if value}
-
-
-def _field_text(value: object) -> str:
-    if isinstance(value, str):
-        if value.startswith(('"', '{', '[')):
-            try:
-                return _field_text(json.loads(value))
-            except json.JSONDecodeError:
-                pass
-        return value.strip()
-    if isinstance(value, dict):
-        return _field_text(value.get("name", value.get("text", value.get("value", ""))))
-    if isinstance(value, list):
-        return "、".join(_field_text(item) for item in value)
-    text = getattr(value, "text", None)
-    if isinstance(text, str):
-        return text.strip()
-    name = getattr(value, "name", None)
-    if isinstance(name, str):
-        return name.strip()
-    return str(value).strip()
-
-
-def _bot_mentioned(mentions: object, bot_open_id: str) -> bool:
-    if not bot_open_id or not isinstance(mentions, list):
-        return False
-    return any(
-        getattr(getattr(mention, "id", None), "open_id", "") == bot_open_id
-        for mention in mentions
-    )
-
-
-def _strip_mentions(text: str, mentions: object, bot_open_id: str) -> str:
-    if not isinstance(mentions, list):
-        return text.strip()
-    result = text
-    for mention in mentions:
-        key = str(getattr(mention, "key", "") or "")
-        if key:
-            is_bot = getattr(getattr(mention, "id", None), "open_id", "") == bot_open_id
-            result = result.replace(key, " " if is_bot else "@" + str(getattr(mention, "name", key)))
-    return "\n".join(line.strip() for line in result.splitlines()).strip()

@@ -8,12 +8,15 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from dotenv import dotenv_values
 
 from agents.speaker_agent.domain.contracts import AnalysisResult, DownstreamResult, ReviewResult, result_from_dict
 from agents.speaker_agent.adapters.feishu.events import on_message
-from agents.speaker_agent.adapters.feishu.gateway import FeishuApiError, FeishuGateway
+from agents.speaker_agent.adapters.feishu.gateway import FeishuGateway
+from shared.feishu.client import FeishuClient
+from shared.feishu.errors import FeishuApiError
 from agents.speaker_agent.intake.normalizer import RequirementNormalizer
 from agents.speaker_agent.domain.models import IncomingDemand
 from agents.speaker_agent.presentation.reply import ReplyFormatter
@@ -268,8 +271,10 @@ class GatewayTests(unittest.TestCase):
         captured = []
         response = SimpleNamespace(success=lambda: True, data=SimpleNamespace())
         update = lambda request: captured.append(request) or response
-        client = SimpleNamespace(bitable=SimpleNamespace(v1=SimpleNamespace(app_table_record=SimpleNamespace(update=update))))
-        gateway = FeishuGateway(settings(Path("unused")), client=client)
+        client = Mock()
+        client.bitable.v1.app_table_record.update.side_effect = update
+        config = settings(Path("unused"))
+        gateway = FeishuGateway(config, feishu=FeishuClient(config.feishu, client=client))
         gateway.write_result("rec1", "# 中文结论\n正文")
         fields = captured[0].request_body.fields
         self.assertEqual(fields["状态"], "已生成")

@@ -3,13 +3,13 @@ from __future__ import annotations
 import logging
 import threading
 
-import lark_oapi as lark
 from dotenv import load_dotenv
 
 from agents.speaker_agent.config import ConfigError, Settings
 from agents.speaker_agent.adapters.feishu.events import register_handlers
 from agents.speaker_agent.adapters.feishu.gateway import FeishuGateway
 from agents.speaker_agent.orchestration.service import DemandAgent
+from shared.feishu.connection import create_socket_client, new_event_dispatcher
 
 
 LOGGER = logging.getLogger(__name__)
@@ -34,7 +34,7 @@ def main() -> None:
     gateway = FeishuGateway(settings)
     agent = DemandAgent(settings, gateway)
     dispatcher = register_handlers(
-        lark.EventDispatcherHandler.builder("", ""),
+        new_event_dispatcher(),
         agent,
     ).build()
 
@@ -50,12 +50,7 @@ def main() -> None:
         poller.start()
 
     LOGGER.info("Feishu demand agent started")
-    socket_client = lark.ws.Client(
-        settings.app_id,
-        settings.app_secret,
-        event_handler=dispatcher,
-        log_level=getattr(lark.LogLevel, settings.log_level, lark.LogLevel.INFO),
-    )
+    socket_client = create_socket_client(settings.feishu, dispatcher, log_level=settings.log_level)
     socket_client.start()
 
 

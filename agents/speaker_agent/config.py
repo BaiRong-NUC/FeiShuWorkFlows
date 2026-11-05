@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from shared.llm.config import DeepSeekConfig
+from shared.feishu.config import BitableConfig, FeishuConfig
 
 
 class ConfigError(ValueError):
@@ -55,17 +56,22 @@ class Settings:
     intake_max_chars: int = 12000
     brief_field: str = "需求单"
 
+    @property
+    def feishu(self) -> FeishuConfig:
+        return FeishuConfig(self.app_id, self.app_secret)
+
+    @property
+    def bitable(self) -> BitableConfig:
+        return BitableConfig(self.bitable_app_token, self.bitable_table_id, self.bitable_url)
+
     @classmethod
     def from_env(cls) -> "Settings":
-        app_id = _value("FEISHU_APP_ID")
-        app_secret = _value("FEISHU_APP_SECRET")
+        credentials = FeishuConfig.from_env()
         bitable_app_token = _value("FEISHU_BITABLE_APP_TOKEN")
         bitable_table_id = _value("FEISHU_BITABLE_TABLE_ID")
         missing = [
             name
             for name, value in (
-                ("FEISHU_APP_ID", app_id),
-                ("FEISHU_APP_SECRET", app_secret),
                 ("FEISHU_BITABLE_APP_TOKEN", bitable_app_token),
                 ("FEISHU_BITABLE_TABLE_ID", bitable_table_id),
             )
@@ -80,8 +86,8 @@ class Settings:
 
         runtime_dir = Path(_value("FEISHU_RUNTIME_DIR", "runtime") or "runtime")
         return cls(
-            app_id=app_id,
-            app_secret=app_secret,
+            app_id=credentials.app_id,
+            app_secret=credentials.app_secret,
             bitable_app_token=bitable_app_token,
             bitable_table_id=bitable_table_id,
             bitable_url=_value("FEISHU_BITABLE_URL"),

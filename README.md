@@ -6,14 +6,14 @@ Speaker 默认使用 DeepSeek 理解聊天中的需求意图，整理标题、�
 
 ## 目录
 
-Agent 业务代码放在 `agents/` 下，后续分析、评审等 Agent 与 `speaker_agent/` 并列。大模型调用等可复用基础模块放在 `shared/`；回复模块和业务模板留在各 Agent 下。
+Agent 业务代码放在 `agents/` 下，后续分析、评审等 Agent 与 `speaker_agent/` 并列。大模型调用和飞书 API 等可复用基础模块放在 `shared/`；需求字段映射、状态流转、回复模块和业务模板留在各 Agent 下。
 
 ```text
 agents/
   speaker_agent/
     main.py                 # 飞书长连接启动入口
     config.py               # 环境配置
-    adapters/feishu/        # 飞书 API、消息与台账事件
+    adapters/feishu/         # 需求台账映射、消息路由和状态触发策略
     domain/                 # 需求模型、结果契约、外部 I/O 接口
     intake/                 # 台账和聊天内容整理
     orchestration/          # 接收、交接、结果合并与回填
@@ -22,10 +22,13 @@ agents/
     presentation/           # Markdown 格式化
     templates/              # intake_prompt.md、requirement.md、reply.md
 shared/
+  feishu/                   # 公共飞书连接、表格、消息、云文档、权限及接口
   llm/                      # 公共 DeepSeek 客户端、模型配置、调用接口和异常
 tests/                      # 本地替身测试，不连接真实飞书或 DeepSeek
 runtime/                    # 本地运行数据，不提交 Git
 ```
+
+其他 Agent 可直接复用 [公共飞书模块](shared/feishu/README.md)，不必引用 Speaker。`FeishuGateway` 是 Speaker 的业务适配器：它通过公共 `FeishuServices` 协议调用飞书，负责需求字段和状态映射。`shared/feishu/` 不包含“需求标题”“待生成方案”等业务约定，也不加载 Agent 模板。
 
 ## 台账字段
 
