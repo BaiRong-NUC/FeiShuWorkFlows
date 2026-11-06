@@ -8,9 +8,10 @@ from uuid import uuid4
 from agents.speaker_agent.adapters.feishu.delivery import FeishuDelivery
 from agents.speaker_agent.config import Settings
 from agents.speaker_agent.domain.models import DemandRecord
+from agents.speaker_agent.persistence.sheet_creations import SheetCreationStore
 from shared.feishu.catalog import TableReference
 from shared.feishu.contracts import WorkspaceServices
-from shared.feishu.errors import FeishuApiError
+from shared.feishu.errors import FeishuApiError, FeishuRecordNotFoundError
 from shared.feishu.sheets import column_name
 
 LOGGER = logging.getLogger(__name__)
@@ -26,6 +27,7 @@ class SheetGateway(FeishuDelivery):
         self.sheets = feishu.sheets
         self._lock = threading.RLock()
         self._last_row = 1
+        self.creations = SheetCreationStore(settings.runtime_dir / "sheet-creations.sqlite3")
 
     def _read(self) -> tuple[list[str], list[tuple[int, dict[str, Any]]]]:
         # A bare sheet ID requests its current populated range, including newly appended rows.
@@ -111,7 +113,9 @@ class SheetGateway(FeishuDelivery):
             details = self._duplicate_details({record_id: [number for number, _ in matches]})
             raise FeishuApiError(f"工作表“{self.ref.title}”的 ID 不唯一：{details}；拒绝处理该 ID，避免回填错误")
         if not matches:
-            raise FeishuApiError(f"工作表“{self.ref.title}”中找不到记录 ID")
+            raise FeishuRecordNotFoundError(
+                record_id, f"工作表“{self.ref.title}”中找不到记录 ID {record_id!r}；"
+                "请核对该记录是否仍在表中，或 ID 是否发生变化")
         return matches[0]
 
     def _update(self, record_id: str, values: dict[str, Any], *, result: str = "") -> None:
@@ -157,13 +161,18 @@ class SheetGateway(FeishuDelivery):
         return options
 
     def create_record(self, fields: dict[str, Any], *, client_token: str = "") -> str:
-        record_id = "spk_" + (client_token or str(uuid4()))
+        token = client_token or str(uuid4())
         with self._lock:
             headers, rows = self._read()
-            if any(_text(row.get("ID")) == record_id for _, row in rows):
-                self._find(rows, record_id)
-                return record_id
-            mapped = {"ID": record_id, "描述": fields.get(self.settings.raw_field, ""),
+            # Reuse older successful writes without ever generating another UUID in the sheet.
+            legacy_id = "spk_" + token
+            if any(_text(row.get("ID")) == legacy_id for _, row in rows):
+                self._find(rows, legacy_id)
+                return legacy_id
+            saved = self.creations.get(self.ref.key, token)
+            if saved and saved["state"] != "prepared":
+                return self._recover_creation(token, saved, rows)
+            mapped = {"描述": fields.get(self.settings.raw_field, ""),
                       "状态": fields.get(self.settings.status_field, self.settings.processing_status),
                       **{name: fields.get(name, "") for name in ("版本", "责任人", "备注")}}
             for name in ("版本", "状态", "责任人"):
@@ -176,9 +185,34 @@ class SheetGateway(FeishuDelivery):
                 value = _text(mapped[name])
                 if value and options is not None and value not in options:
                     raise FeishuApiError(f"工作表“{self.ref.title}”的{name}不在已有下拉选项中，请确认；不会新增选项")
+            numbers = [int(value) for _, current in rows
+                       if (value := _text(current.get("ID"))).isascii() and value.isdecimal()]
+            saved = self.creations.reserve(self.ref.key, token, max(numbers, default=0) + 1, mapped)
+            # Read again before writing: an editor may have filled the next number in the meantime.
+            headers, rows = self._read()
+            if saved["state"] != "prepared":
+                return self._recover_creation(token, saved, rows)
+            record_id = str(saved["number"])
+            if any(_text(current.get("ID")) == record_id for _, current in rows):
+                raise FeishuApiError(f"工作表“{self.ref.title}”的预留编号 {record_id} 已被占用，暂停建档以免覆盖人工记录")
             width = max(headers.index(name) for name in INPUT_COLUMNS) + 1
-            row = [mapped.get(name, "") for name in headers[:width]]
+            row = [saved["fields"].get(name, "") for name in headers[:width]]
+            if not self.creations.start(self.ref.key, token):
+                raise FeishuApiError(f"需求编号 {record_id} 已开始追加，等待回读确认；不会重复追加")
             self.sheets.append_rows(self.ref.file_token, f"{self.ref.table_id}!A1:{column_name(width)}", [row])
+            self.creations.confirm(self.ref.key, token)
+        return record_id
+
+    def _recover_creation(self, token: str, saved: dict[str, Any],
+                          rows: list[tuple[int, dict[str, Any]]]) -> str:
+        record_id = str(saved["number"])
+        if saved["state"] == "confirmed":
+            return record_id
+        # A failed response may still have appended the row. Never replay an uncertain write.
+        _, current = self._find(rows, record_id)
+        if any(_text(current.get(name)) != _text(saved["fields"].get(name)) for name in INPUT_COLUMNS):
+            raise FeishuApiError(f"工作表“{self.ref.title}”的编号 {record_id} 与原追加内容不一致，暂停确认；不会改绑人工记录")
+        self.creations.confirm(self.ref.key, token)
         return record_id
 
 

@@ -20,6 +20,7 @@ from agents.speaker_agent.presentation.reply import ReplyFormatter
 from agents.speaker_agent.persistence.state import ProcessedEventStore, WorkflowStore
 from shared.llm.deepseek import DeepSeekClient
 from shared.llm.contracts import ModelError
+from shared.feishu.errors import FeishuRecordNotFoundError
 from agents.speaker_agent.domain.intake import DemandInterpreter, parse_intake_decision
 from agents.speaker_agent.intake.interpreter import ModelDemandInterpreter
 from agents.speaker_agent.presentation.brief import BriefFormatter
@@ -108,12 +109,18 @@ class DemandAgent:
                 self.workflows.finish_work(item.key)
                 return result
             except Exception as exc:
+                if (isinstance(exc, FeishuRecordNotFoundError)
+                        and (item.source_message is None or self.workflows.latest_job(exc.record_id) is not None)):
+                    self._cancel_missing_record(exc)
+                    return ProcessingResult(exc.record_id, False, "原台账记录已移除，旧任务已取消", error=str(exc))
                 # Preserve both inbox work and the created-record mapping for retry.
-                self.workflows.defer_work(item.key)
+                delay = self._retry_delay(exc)
+                self.workflows.defer_work(item.key, delay=delay)
                 if job is not None:
                     self._defer_job(job, exc)
-                LOGGER.exception("Speaker 处理暂未完成，任务已保留，30 秒后重试：%s", item.key)
-                return ProcessingResult(item.record_id, False, "", error=str(exc))
+                self._log_retry(item.key, exc)
+                record_id = exc.record_id if isinstance(exc, FeishuRecordNotFoundError) else item.record_id
+                return ProcessingResult(record_id, False, "", error=str(exc))
 
     def resume_pending(self) -> None:
         with self._lock:
@@ -123,12 +130,30 @@ class DemandAgent:
                 try:
                     self._advance(job)
                 except Exception as exc:
+                    if isinstance(exc, FeishuRecordNotFoundError):
+                        self._cancel_missing_record(exc)
+                        continue
                     self._defer_job(job, exc)
-                    LOGGER.error("Speaker 任务 %s 暂未完成，30 秒后重试：%s", job["id"], exc)
+                    self._log_retry(job["id"], exc)
+
+    def _cancel_missing_record(self, error: FeishuRecordNotFoundError) -> None:
+        self.workflows.cancel_record(error.record_id, str(error))
+        LOGGER.info("Speaker 原台账记录已移除，旧任务已取消，保留本地历史：%s", error)
+
+    @staticmethod
+    def _retry_delay(error: Exception) -> int:
+        return 300 if isinstance(error, FeishuRecordNotFoundError) else 30
+
+    def _log_retry(self, key: str, error: Exception) -> None:
+        if isinstance(error, FeishuRecordNotFoundError):
+            LOGGER.warning("Speaker 台账记录暂时缺失，任务及建档关联已保留，%s 秒后复查；"
+                           "不会自动重建或改绑记录：%s；%s", self._retry_delay(error), key, error)
+        else:
+            LOGGER.exception("Speaker 处理暂未完成，任务已保留，30 秒后重试：%s", key)
 
     def _defer_job(self, job: dict, error: Exception) -> None:
         job["last_error"] = str(error)
-        job["retry_at"] = time.time() + 30
+        job["retry_at"] = time.time() + self._retry_delay(error)
         self.workflows.save_job(job)
 
     def submit_result(self, request_id: str, result: DownstreamResult) -> ProcessingResult:
@@ -137,8 +162,8 @@ class DemandAgent:
             job = self.workflows.get_job(request_id)
             if job is None:
                 raise ValueError("unknown request_id")
-            if job["state"] == "superseded":
-                raise ValueError("request has been superseded")
+            if job["state"] in {"superseded", "cancelled"}:
+                raise ValueError("request has been superseded or cancelled")
             validated = result_from_dict(asdict(result))
             if job["state"] != "done":
                 self._merge(job, validated)
@@ -181,6 +206,9 @@ class DemandAgent:
             if draft.task_type == "inquiry":
                 return self._inquiry_job(draft, demand)
             token, record_id = self.workflows.creation(demand.message_id)
+            previous = self.workflows.latest_job(record_id) if record_id else None
+            if previous and previous["state"] == "cancelled":
+                return None
             if not record_id:
                 fields = self.normalizer.ledger_fields(draft)
                 if self.interpreter is not None:
@@ -205,14 +233,14 @@ class DemandAgent:
         if (previous and previous["fingerprint"] == fingerprint and previous["state"] == "done"
                 and self.settings.source_kind == "sheet"):
             return None
-        if previous and previous["fingerprint"] == fingerprint and previous["state"] not in {"done", "superseded"}:
+        if previous and previous["fingerprint"] == fingerprint and previous["state"] not in {"done", "superseded", "cancelled"}:
             if item.reply_to_message_id and not previous["reply_to"]:
                 previous["reply_to"] = item.reply_to_message_id
                 self.workflows.save_job(previous)
             return previous
         if previous and record.status == self.settings.processing_status and previous["state"] == "done":
             return None
-        if previous and previous["state"] != "done":
+        if previous and previous["state"] not in {"done", "cancelled"}:
             previous["state"] = "superseded"
             self.workflows.save_job(previous)
         # Fingerprints always describe source data, never nondeterministic model output.
@@ -306,6 +334,9 @@ class DemandAgent:
 
     def _advance(self, job: dict) -> ProcessingResult:
         brief = RequirementBrief(**job["brief"])
+        current = self.workflows.get_job(job["id"])
+        if current and current["state"] == "cancelled":
+            return ProcessingResult(brief.record_id, False, "原台账记录已移除，旧任务已取消")
         if job.get("retry_at", 0) > time.time():
             return ProcessingResult(brief.record_id, False, "任务已保留，等待重试")
         job.pop("retry_at", None)

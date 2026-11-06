@@ -20,9 +20,11 @@ from lark_oapi.core.model import BaseResponse, RawResponse
 from agents.speaker_agent.config import ConfigError, Settings
 from agents.speaker_agent.adapters.feishu.sheets_gateway import SheetGateway
 from agents.speaker_agent.domain.contracts import AnalysisResult, DownstreamResult, ReviewResult
+from agents.speaker_agent.domain.models import IncomingDemand
+from agents.speaker_agent.orchestration.service import DemandAgent
 from agents.speaker_agent.orchestration.workspace import SpeakerWorkspace
 from shared.feishu.catalog import CatalogClient, TableReference, parse_file_url
-from shared.feishu.errors import FeishuApiError
+from shared.feishu.errors import FeishuApiError, FeishuRecordNotFoundError
 from shared.feishu.sheets import SheetsClient
 from test_agent import settings
 from test_shared_feishu import FakeFeishuServices
@@ -128,9 +130,82 @@ class SourceTests(unittest.TestCase):
             self.gateway.update_status("1", "生成中")
         self.assertEqual(self.api.writes, [])
         self.api.rows["one"][2][0] = 2
-        with self.assertRaisesRegex(FeishuApiError, "找不到"):
+        with self.assertRaisesRegex(FeishuRecordNotFoundError, "找不到记录 ID 'missing'"):
             self.gateway.write_result("missing", "不应写入")
         self.assertEqual(self.api.writes, [])
+
+    def test_deleted_chat_record_cancels_queue_and_job_across_restart(self):
+        workspace = SpeakerWorkspace(self.config, feishu=self.api)
+        agent = workspace.agents[self.api.refs[0].key]
+        agent.accept_message(IncomingDemand("增加导出功能", "ou_sender", "om_missing"))
+        item = required(agent._next_item())
+        with patch.object(self.api, "reply_text", side_effect=FeishuApiError("回复暂时失败")), \
+             patch("time.time", return_value=1000), self.assertLogs(level="ERROR"):
+            self.assertFalse(required(agent.process_item(item)).ok)
+        token, record_id = agent.workflows.creation("om_missing")
+        self.api.rows["one"].pop()
+        job = required(agent.workflows.latest_job(record_id))
+
+        with patch("time.time", return_value=1030), self.assertLogs(level="INFO") as logs:
+            result = required(agent.process_item(item))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.record_id, record_id)
+        self.assertIn(record_id, "\n".join(logs.output))
+        self.assertTrue(all(record.exc_info is None for record in logs.records))
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "cancelled")
+        self.assertNotIn("retry_at", required(agent.workflows.get_job(job["id"])))
+        self.assertEqual(agent.workflows.creation("om_missing"), (token, record_id))
+
+        restarted = DemandAgent(agent.settings, agent.gateway)
+        with patch("time.time", return_value=2000), patch.object(self.api, "read_range") as read:
+            self.assertIsNone(restarted._next_item())
+            restarted.resume_pending()
+            read.assert_not_called()
+        with patch.object(self.api, "append_rows") as append:
+            self.assertIsNone(restarted.process_item(item))
+            append.assert_not_called()
+        self.assertEqual(required(restarted.workflows.latest_job(record_id))["id"], job["id"])
+        self.assertEqual(len(self.api.rows["one"]), 3)
+        with self.assertRaisesRegex(ValueError, "cancelled"):
+            restarted.submit_result(job["id"], DownstreamResult(AnalysisResult("旧分析"), ReviewResult("旧评审")))
+        self.assertEqual(self.api.writes, [])
+
+    def test_deletion_during_resume_cancels_old_result_but_manual_restore_can_start_new_job(self):
+        workspace = SpeakerWorkspace(self.config, feishu=self.api)
+        agent = workspace.agents[self.api.refs[0].key]
+        agent.enqueue_record("1")
+        self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+        job = required(agent.workflows.latest_job("1"))
+        saved_row = self.api.rows["one"].pop(1)
+        with patch("time.time", return_value=1000), self.assertLogs(level="INFO"):
+            agent.resume_pending()
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "cancelled")
+        self.api.rows["one"].append(saved_row)
+        with patch("time.time", return_value=1300), patch.object(self.api, "append_rows") as append, \
+             patch.object(agent.downstream, "evaluate", wraps=agent.downstream.evaluate) as evaluate:
+            agent.resume_pending()
+            append.assert_not_called()
+            evaluate.assert_not_called()
+        agent.scan_pending()
+        self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+        self.assertNotEqual(required(agent.workflows.latest_job("1"))["id"], job["id"])
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "cancelled")
+        self.assertEqual(self.api.writes, [])
+
+    def test_unconfirmed_new_row_is_retained_until_visible_without_duplicate_append(self):
+        workspace = SpeakerWorkspace(self.config, feishu=self.api)
+        agent = workspace.agents[self.api.refs[0].key]
+        agent.accept_message(IncomingDemand("增加导出功能", "ou_sender", "om_delayed"))
+        item = required(agent._next_item())
+        with patch.object(agent.gateway, "get_record", side_effect=FeishuRecordNotFoundError("spk_delayed", "暂不可见")), \
+             patch("time.time", return_value=1000), self.assertLogs(level="WARNING"):
+            self.assertFalse(required(agent.process_item(item)).ok)
+        with patch("time.time", return_value=1299):
+            self.assertIsNone(agent._next_item())
+        with patch("time.time", return_value=1300), patch.object(self.api, "append_rows") as append:
+            self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
+            append.assert_not_called()
+        self.assertEqual(len(self.api.rows["one"]), 4)
 
     def test_create_is_idempotent_after_response_loss_and_preserves_newlines(self):
         self.api.lose_append_response = True
@@ -138,7 +213,9 @@ class SourceTests(unittest.TestCase):
                   self.config.requester_field: [{"id": "ou_requester"}], self.config.status_field: "生成中"}
         with self.assertRaisesRegex(FeishuApiError, "响应丢失"):
             self.gateway.create_record(fields, client_token="stable")
-        record_id = self.gateway.create_record(fields, client_token="stable")
+        restarted = SheetGateway(self.config, self.api.refs[0], feishu=self.api)
+        record_id = restarted.create_record(fields, client_token="stable")
+        self.assertEqual(record_id, "3")
         self.assertEqual(len(self.api.rows["one"]), 4)
         record = self.gateway.get_record(record_id)
         self.assertEqual(record.fields[self.config.raw_field], "第一行\n第二行")
@@ -146,6 +223,68 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(self.api.rows["one"][0]), 7)
         self.assertEqual(len(self.api.rows["one"][-1]), 6)
         self.assertEqual(self.api.rows["one"][-1][3], "")
+
+    def test_requirement_numbers_follow_maximum_and_do_not_add_internal_columns(self):
+        self.api.rows["one"][1][0] = 119
+        self.api.rows["one"].extend([["spk_legacy", "", "已完成", "", "旧需求"], [None] * 7])
+        headers = self.api.rows["one"][0][:]
+        first = self.gateway.create_record({self.config.raw_field: "相同描述"}, client_token="first")
+        second = self.gateway.create_record({self.config.raw_field: "相同描述"}, client_token="second")
+        self.assertEqual((first, second), ("120", "121"))
+        self.assertEqual(self.api.rows["one"][-2][0], 120)
+        self.assertEqual(self.api.rows["one"][-1][0], 121)
+        self.assertEqual(self.api.rows["one"][0], headers)
+        self.assertEqual(len(self.api.rows["one"][-1]), 6)
+
+    def test_uncertain_missing_append_is_not_replayed_after_restart(self):
+        fields = {self.config.raw_field: "新需求"}
+        with patch.object(self.api, "append_rows", side_effect=FeishuApiError("网络中断")):
+            with self.assertRaisesRegex(FeishuApiError, "网络中断"):
+                self.gateway.create_record(fields, client_token="uncertain")
+        restarted = SheetGateway(self.config, self.api.refs[0], feishu=self.api)
+        with patch.object(self.api, "append_rows") as append, self.assertRaises(FeishuRecordNotFoundError):
+            restarted.create_record(fields, client_token="uncertain")
+        append.assert_not_called()
+        self.assertEqual(len(self.api.rows["one"]), 3)
+
+    def test_uncertain_append_cannot_claim_a_different_manual_requirement(self):
+        self.api.lose_append_response = True
+        fields = {self.config.raw_field: "原需求"}
+        with self.assertRaises(FeishuApiError):
+            self.gateway.create_record(fields, client_token="uncertain")
+        self.api.rows["one"][-1][4] = "人工修改后的需求"
+        before = copy.deepcopy(self.api.rows)
+        with self.assertRaisesRegex(FeishuApiError, "不一致"):
+            self.gateway.create_record(fields, client_token="uncertain")
+        self.assertEqual(self.api.rows, before)
+
+    def test_numbers_are_separate_per_sheet_and_deleted_allocations_are_not_reused(self):
+        fields = {self.config.raw_field: "新需求"}
+        self.assertEqual(self.gateway.create_record(fields, client_token="same"), "3")
+        self.api.rows["one"].pop()
+        restarted = SheetGateway(self.config, self.api.refs[0], feishu=self.api)
+        self.assertEqual(restarted.create_record(fields, client_token="same"), "3")
+        self.assertEqual(len(self.api.rows["one"]), 3)
+        self.assertEqual(restarted.create_record(fields, client_token="next"), "4")
+        other = SheetGateway(self.config, self.api.refs[1], feishu=self.api)
+        self.assertEqual(other.create_record(fields, client_token="same"), "3")
+
+    def test_manual_number_claimed_before_append_is_not_overwritten(self):
+        original = self.api.read_range
+        reads = 0
+
+        def read(token: str, range_name: str) -> list[list[Any]]:
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                self.api.rows["one"].append([3, "", "待修改", "", "人工新增需求", ""])
+            return original(token, range_name)
+
+        with patch.object(self.api, "read_range", side_effect=read), \
+             patch.object(self.api, "append_rows") as append, self.assertRaisesRegex(FeishuApiError, "已被占用"):
+            self.gateway.create_record({self.config.raw_field: "聊天需求"}, client_token="collision")
+        append.assert_not_called()
+        self.assertEqual(self.api.rows["one"][-1][4], "人工新增需求")
 
     def test_historical_duplicate_ids_do_not_block_unique_records_or_chat_creation(self):
         original = copy.deepcopy(self.api.rows["one"][2])
@@ -212,7 +351,7 @@ class SourceTests(unittest.TestCase):
                                               client_token="six-columns")
         self.gateway.update_status(record_id, "生成中", error="等待下层结果")
         self.assertEqual(self.api.rows["one"][0], headers)
-        self.assertEqual(self.api.rows["one"][-1], [record_id, "1.5.1", "待修改", "龚柏荣", "缓存冷却改为15s", "仅缓存"])
+        self.assertEqual(self.api.rows["one"][-1], [int(record_id), "1.5.1", "待修改", "龚柏荣", "缓存冷却改为15s", "仅缓存"])
         self.assertEqual(self.api.writes, [])
         self.gateway.write_result(record_id, "下层结果")
         self.gateway.write_result(record_id, "下层结果")

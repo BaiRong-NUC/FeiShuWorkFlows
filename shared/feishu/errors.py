@@ -5,6 +5,14 @@ class FeishuApiError(RuntimeError):
     """Raised when a Feishu OpenAPI call fails."""
 
 
+class FeishuRecordNotFoundError(FeishuApiError):
+    """A successful read did not contain the requested record."""
+
+    def __init__(self, record_id: str, message: str) -> None:
+        super().__init__(message)
+        self.record_id = record_id
+
+
 ServiceT = TypeVar("ServiceT")
 DataT = TypeVar("DataT", covariant=True)
 

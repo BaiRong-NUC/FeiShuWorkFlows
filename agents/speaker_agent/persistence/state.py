@@ -113,9 +113,9 @@ class WorkflowStore:
         with self.connect() as db:
             db.execute("DELETE FROM inbox WHERE key=?", (key,))
 
-    def defer_work(self, key: str) -> None:
+    def defer_work(self, key: str, *, delay: int = 30) -> None:
         with self.connect() as db:
-            db.execute("UPDATE inbox SET ready=? WHERE key=?", (time.time() + 30, key))
+            db.execute("UPDATE inbox SET ready=? WHERE key=?", (time.time() + delay, key))
 
     def save_job(self, job: dict) -> None:
         with self.connect() as db:
@@ -137,7 +137,24 @@ class WorkflowStore:
     def unfinished_jobs(self) -> list[dict]:
         with self.connect() as db:
             jobs = [json.loads(row[0]) for row in db.execute("SELECT payload FROM jobs ORDER BY rowid")]
-        return [job for job in jobs if job["state"] not in {"done", "superseded"}]
+        return [job for job in jobs if job["state"] not in {"done", "superseded", "cancelled"}]
+
+    def cancel_record(self, record_id: str, reason: str) -> None:
+        """Retain history, but stop jobs and queued work for a removed source row."""
+        with self.connect() as db:
+            for job_id, payload in db.execute("SELECT id,payload FROM jobs WHERE record_id=?", (record_id,)).fetchall():
+                job = json.loads(payload)
+                if job["state"] not in {"done", "superseded", "cancelled"}:
+                    job["state"] = "cancelled"
+                    job["last_error"] = reason
+                    job.pop("retry_at", None)
+                    db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(job, ensure_ascii=False), job_id))
+            message_ids = {row[0] for row in db.execute("SELECT message_id FROM creations WHERE record_id=?", (record_id,))}
+            for key, payload in db.execute("SELECT key,payload FROM inbox").fetchall():
+                item = json.loads(payload)
+                source = item.get("source_message") or {}
+                if item.get("record_id") == record_id or source.get("message_id") in message_ids:
+                    db.execute("DELETE FROM inbox WHERE key=?", (key,))
 
     def creation(self, message_id: str) -> tuple[str, str]:
         with self.connect() as db:
