@@ -54,9 +54,9 @@ class SheetsClient:
             raise FeishuApiError("电子表格接口没有返回 data")
         return data
 
-    def read_range(self, token: str, range_name: str) -> list[list[Any]]:
+    def read_range(self, token: str, range_name: str, *, value_render_option: str = "ToString") -> list[list[Any]]:
         data = self._request(token, "values/" + quote(range_name, safe=""), HttpMethod.GET,
-                             queries=[("valueRenderOption", "ToString"), ("dateTimeRenderOption", "FormattedString")])
+                             queries=[("valueRenderOption", value_render_option), ("dateTimeRenderOption", "FormattedString")])
         value_range = data.get("valueRange")
         if not isinstance(value_range, dict):
             raise FeishuApiError("电子表格接口没有返回 valueRange")

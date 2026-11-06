@@ -41,7 +41,17 @@ class SheetCreationStore:
                 row = db.execute("SELECT number,fields,state FROM sheet_creations WHERE source=? AND token=?",
                                  (source, token)).fetchone()
                 if row:
-                    return {"number": row[0], "fields": json.loads(row[1]), "state": row[2]}
+                    if row[2] != "prepared":
+                        return {"number": row[0], "fields": json.loads(row[1]), "state": row[2]}
+                    # Before any write starts we may follow concurrent manual additions.
+                    number = row[0]
+                    if number < minimum:
+                        last = db.execute("SELECT MAX(number) FROM sheet_creations WHERE source=?", (source,)).fetchone()[0]
+                        number = max(minimum, (last or 0) + 1)
+                    values = {**fields, "ID": number}
+                    db.execute("UPDATE sheet_creations SET number=?,fields=? WHERE source=? AND token=?",
+                               (number, json.dumps(values, ensure_ascii=False), source, token))
+                    return {"number": number, "fields": values, "state": "prepared"}
                 last = db.execute("SELECT MAX(number) FROM sheet_creations WHERE source=?", (source,)).fetchone()[0]
                 number = max(minimum, (last or 0) + 1)
                 values = {**fields, "ID": number}

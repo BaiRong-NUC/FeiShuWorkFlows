@@ -87,6 +87,8 @@ class WorkflowStore:
                     message_id TEXT PRIMARY KEY, token TEXT NOT NULL, record_id TEXT NOT NULL DEFAULT '');
                 CREATE TABLE IF NOT EXISTS intakes (
                     message_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS missing_records (
+                    record_id TEXT PRIMARY KEY, observations INTEGER NOT NULL, checked_at REAL NOT NULL);
             """)
 
     @contextmanager
@@ -139,9 +141,27 @@ class WorkflowStore:
             jobs = [json.loads(row[0]) for row in db.execute("SELECT payload FROM jobs ORDER BY rowid")]
         return [job for job in jobs if job["state"] not in {"done", "superseded", "cancelled"}]
 
+    def record_found(self, record_id: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM missing_records WHERE record_id=?", (record_id,))
+
+    def confirm_missing(self, record_id: str, *, interval: int = 300) -> bool:
+        """Require three spaced observations, shared by inbox and resume across restarts."""
+        now = time.time()
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT observations,checked_at FROM missing_records WHERE record_id=?",
+                             (record_id,)).fetchone()
+            count = row[0] if row else 0
+            if row is None or now - row[1] >= interval:
+                count += 1
+                db.execute("INSERT OR REPLACE INTO missing_records VALUES (?,?,?)", (record_id, count, now))
+            return count >= 3
+
     def cancel_record(self, record_id: str, reason: str) -> None:
         """Retain history, but stop jobs and queued work for a removed source row."""
         with self.connect() as db:
+            db.execute("DELETE FROM missing_records WHERE record_id=?", (record_id,))
             for job_id, payload in db.execute("SELECT id,payload FROM jobs WHERE record_id=?", (record_id,)).fetchall():
                 job = json.loads(payload)
                 if job["state"] not in {"done", "superseded", "cancelled"}:

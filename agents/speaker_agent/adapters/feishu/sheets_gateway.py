@@ -26,7 +26,6 @@ class SheetGateway(FeishuDelivery):
         self.ref = ref
         self.sheets = feishu.sheets
         self._lock = threading.RLock()
-        self._last_row = 1
         self.creations = SheetCreationStore(settings.runtime_dir / "sheet-creations.sqlite3")
 
     def _read(self) -> tuple[list[str], list[tuple[int, dict[str, Any]]]]:
@@ -34,7 +33,6 @@ class SheetGateway(FeishuDelivery):
         rows = self.sheets.read_range(self.ref.file_token, self.ref.table_id)
         if not rows:
             raise FeishuApiError(f"工作表“{self.ref.title}”没有表头")
-        self._last_row = max((i for i, row in enumerate(rows, 1) if any(_text(value) for value in row)), default=1)
         headers = [_text(value) for value in rows[0]]
         while headers and not headers[-1]:
             headers.pop()
@@ -149,7 +147,7 @@ class SheetGateway(FeishuDelivery):
         target_row = min(row, self.ref.row_count) if self.ref.row_count else row
         rules = self.sheets.read_dropdowns(self.ref.file_token,
                                           f"{self.ref.table_id}!{column}{target_row}:{column}{target_row}")
-        if not rules and target_row > 2:
+        if not rules and target_row > 2 and self.ref.row_count and row > self.ref.row_count:
             rules = self.sheets.read_dropdowns(self.ref.file_token, f"{self.ref.table_id}!{column}2:{column}2")
         options: set[str] | None = None
         for rule in rules:
@@ -172,46 +170,74 @@ class SheetGateway(FeishuDelivery):
             saved = self.creations.get(self.ref.key, token)
             if saved and saved["state"] != "prepared":
                 return self._recover_creation(token, saved, rows)
-            mapped = {"描述": fields.get(self.settings.raw_field, ""),
-                      "状态": fields.get(self.settings.status_field, self.settings.processing_status),
-                      **{name: fields.get(name, "") for name in ("版本", "责任人", "备注")}}
-            for name in ("版本", "状态", "责任人"):
-                options = self._options(column_name(headers.index(name) + 1), self._last_row + 1)
-                if name == "状态":
-                    candidates = ("待修改", "待处理", self.settings.trigger_status)
-                    mapped[name] = next((value for value in candidates if options is None or value in options), "")
-                    if not mapped[name]:
-                        raise FeishuApiError(f"工作表“{self.ref.title}”没有可用的待处理状态，请确认现有下拉选项")
-                value = _text(mapped[name])
-                if value and options is not None and value not in options:
-                    raise FeishuApiError(f"工作表“{self.ref.title}”的{name}不在已有下拉选项中，请确认；不会新增选项")
-            numbers = [int(value) for _, current in rows
-                       if (value := _text(current.get("ID"))).isascii() and value.isdecimal()]
-            saved = self.creations.reserve(self.ref.key, token, max(numbers, default=0) + 1, mapped)
-            # Read again before writing: an editor may have filled the next number in the meantime.
-            headers, rows = self._read()
-            if saved["state"] != "prepared":
-                return self._recover_creation(token, saved, rows)
-            record_id = str(saved["number"])
-            if any(_text(current.get("ID")) == record_id for _, current in rows):
-                raise FeishuApiError(f"工作表“{self.ref.title}”的预留编号 {record_id} 已被占用，暂停建档以免覆盖人工记录")
-            width = max(headers.index(name) for name in INPUT_COLUMNS) + 1
-            row = [saved["fields"].get(name, "") for name in headers[:width]]
-            if not self.creations.start(self.ref.key, token):
-                raise FeishuApiError(f"需求编号 {record_id} 已开始追加，等待回读确认；不会重复追加")
-            self.sheets.append_rows(self.ref.file_token, f"{self.ref.table_id}!A1:{column_name(width)}", [row])
-            self.creations.confirm(self.ref.key, token)
-        return record_id
+            for _ in range(3):
+                headers, rows = self._read()
+                target, append = self._vacancy()
+                mapped = {"描述": fields.get(self.settings.raw_field, ""),
+                          **{name: fields.get(name, "") for name in ("版本", "责任人", "备注")}}
+                for name in ("版本", "状态", "责任人"):
+                    options = self._options(column_name(headers.index(name) + 1), target)
+                    if name == "状态":
+                        candidates = ("待修改", "待处理", self.settings.trigger_status)
+                        mapped[name] = next((value for value in candidates if options is None or value in options), "")
+                        if not mapped[name]:
+                            raise FeishuApiError(f"工作表“{self.ref.title}”没有可用的待处理状态，请确认现有下拉选项")
+                    value = _text(mapped[name])
+                    if value and options is not None and value not in options:
+                        raise FeishuApiError(f"工作表“{self.ref.title}”的{name}不在已有下拉选项中，请确认；不会新增选项")
+                numbers = [int(value) for _, current in rows
+                           if (value := _text(current.get("ID"))).isascii() and value.isdecimal()]
+                saved = self.creations.reserve(self.ref.key, token, max(numbers, default=0) + 1, mapped)
+                current_headers, current_rows = self._read()
+                if saved["state"] != "prepared":
+                    return self._recover_creation(token, saved, current_rows)
+                record_id = str(saved["number"])
+                # Another editor may fill the vacancy, insert a row, or claim our number.
+                # Re-select before starting a write; never replay an uncertain write.
+                if (current_headers != headers or self._vacancy() != (target, append)
+                        or any(_text(current.get("ID")) == record_id for _, current in current_rows)):
+                    continue
+                if not self.creations.start(self.ref.key, token):
+                    raise FeishuApiError(f"需求编号 {record_id} 已开始写入，等待回读确认；不会重复写入")
+                if append:
+                    width = max(headers.index(name) for name in INPUT_COLUMNS) + 1
+                    row = [saved["fields"].get(name) if _text(saved["fields"].get(name)) else None
+                           for name in headers[:width]]
+                    self.sheets.append_rows(self.ref.file_token, f"{self.ref.table_id}!A1:{column_name(width)}", [row])
+                else:
+                    ranges = []
+                    for name, value in saved["fields"].items():
+                        if not _text(value):
+                            continue
+                        column = column_name(headers.index(name) + 1)
+                        ranges.append((f"{self.ref.table_id}!{column}{target}:{column}{target}", [[value]]))
+                    self.sheets.write_ranges(self.ref.file_token, ranges)
+                # A success response alone does not prove that the complete record is readable.
+                _, written = self._read()
+                return self._recover_creation(token, {**saved, "state": "sending"}, written)
+            raise FeishuApiError(f"工作表“{self.ref.title}”正在被编辑，稍后重新寻找空行和可用编号")
+
+    def _vacancy(self) -> tuple[int, bool]:
+        # Formula rendering protects cells such as ="" that appear empty in the UI.
+        # Inspect the entire row, including unlabelled columns and human notes.
+        rows = self.sheets.read_range(self.ref.file_token, self.ref.table_id, value_render_option="Formula")
+        if not rows:
+            raise FeishuApiError(f"工作表“{self.ref.title}”暂时无法读取，稍后重试")
+        for number, row in enumerate(rows[1:], 2):
+            if all(value is None or value == "" for value in row):
+                return number, False
+        number = len(rows) + 1
+        return number, bool(self.ref.row_count and number > self.ref.row_count)
 
     def _recover_creation(self, token: str, saved: dict[str, Any],
                           rows: list[tuple[int, dict[str, Any]]]) -> str:
         record_id = str(saved["number"])
         if saved["state"] == "confirmed":
             return record_id
-        # A failed response may still have appended the row. Never replay an uncertain write.
+        # A failed response may still have written the row. Never replay an uncertain write.
         _, current = self._find(rows, record_id)
         if any(_text(current.get(name)) != _text(saved["fields"].get(name)) for name in INPUT_COLUMNS):
-            raise FeishuApiError(f"工作表“{self.ref.title}”的编号 {record_id} 与原追加内容不一致，暂停确认；不会改绑人工记录")
+            raise FeishuApiError(f"工作表“{self.ref.title}”的编号 {record_id} 与原写入内容不一致，暂停确认；不会改绑人工记录")
         self.creations.confirm(self.ref.key, token)
         return record_id
 

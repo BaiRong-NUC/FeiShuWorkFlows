@@ -36,7 +36,7 @@ class MemoryWorkspace(FakeFeishuServices):
         super().__init__()
         self.catalog = self
         self.sheets = self
-        self.refs = [TableReference("sheet", "book", name, title, "https://example.feishu.cn/wiki/node", column_count=26)
+        self.refs = [TableReference("sheet", "book", name, title, "https://example.feishu.cn/wiki/node", column_count=26, row_count=100)
                      for name, title in (("one", "产品甲"), ("two", "产品乙"))]
         self.rows: dict[str, list[list[Any]]] = {
             ref.table_id: [["ID", "版本", "状态", "责任人", "描述", "备注", "处理备注"],
@@ -45,7 +45,7 @@ class MemoryWorkspace(FakeFeishuServices):
             for ref in self.refs}
         self.writes: list[tuple[str, str, list[list[Any]]]] = []
         self.replies: list[tuple[str, str]] = []
-        self.lose_append_response = False
+        self.lose_write_response = False
         self.dropdowns: dict[str, list[str]] = {}
 
     def read_dropdowns(self, token: str, range_name: str) -> list[dict[str, Any]]:
@@ -56,7 +56,7 @@ class MemoryWorkspace(FakeFeishuServices):
     def discover(self, urls: tuple[str, ...]) -> list[TableReference]:
         return self.refs[:]
 
-    def read_range(self, token: str, range_name: str) -> list[list[Any]]:
+    def read_range(self, token: str, range_name: str, *, value_render_option: str = "ToString") -> list[list[Any]]:
         return copy.deepcopy(self.rows[range_name])
 
     def write_ranges(self, token: str, ranges: list[tuple[str, list[list[Any]]]]) -> None:
@@ -67,15 +67,20 @@ class MemoryWorkspace(FakeFeishuServices):
             index = 0
             for char in column:
                 index = index * 26 + ord(char) - 64
+            while len(self.rows[table]) < int(row):
+                self.rows[table].append([])
             target = self.rows[table][int(row) - 1]
             needed = index - 1 + len(values[0]) - len(target)
-            target.extend([""] * max(0, needed))
+            target.extend([None] * max(0, needed))
             target[index - 1:index - 1 + len(values[0])] = values[0]
+        if self.lose_write_response:
+            self.lose_write_response = False
+            raise FeishuApiError("响应丢失")
 
     def append_rows(self, token: str, range_name: str, rows: list[list[Any]]) -> None:
         self.rows[range_name.split("!", 1)[0]].extend(copy.deepcopy(rows))
-        if self.lose_append_response:
-            self.lose_append_response = False
+        if self.lose_write_response:
+            self.lose_write_response = False
             raise FeishuApiError("响应丢失")
 
     def reply_text(self, message_id: str, text: str, *, uuid: str = "") -> None:
@@ -142,6 +147,7 @@ class SourceTests(unittest.TestCase):
         with patch.object(self.api, "reply_text", side_effect=FeishuApiError("回复暂时失败")), \
              patch("time.time", return_value=1000), self.assertLogs(level="ERROR"):
             self.assertFalse(required(agent.process_item(item)).ok)
+        self.api.writes.clear()
         token, record_id = agent.workflows.creation("om_missing")
         self.api.rows["one"].pop()
         job = required(agent.workflows.latest_job(record_id))
@@ -152,6 +158,14 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(result.record_id, record_id)
         self.assertIn(record_id, "\n".join(logs.output))
         self.assertTrue(all(record.exc_info is None for record in logs.records))
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "waiting")
+        # Inbox and resume checks at the same instant are one observation; restart retains it.
+        agent = DemandAgent(agent.settings, agent.gateway)
+        with patch("time.time", return_value=1030):
+            agent.resume_pending()
+        for now in (1330, 1630):
+            with patch("time.time", return_value=now), self.assertLogs(level="INFO"):
+                agent.process_item(item)
         self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "cancelled")
         self.assertNotIn("retry_at", required(agent.workflows.get_job(job["id"])))
         self.assertEqual(agent.workflows.creation("om_missing"), (token, record_id))
@@ -177,8 +191,9 @@ class SourceTests(unittest.TestCase):
         self.assertTrue(required(agent.process_item(required(agent._next_item()))).ok)
         job = required(agent.workflows.latest_job("1"))
         saved_row = self.api.rows["one"].pop(1)
-        with patch("time.time", return_value=1000), self.assertLogs(level="INFO"):
-            agent.resume_pending()
+        for now in (1000, 1300, 1600):
+            with patch("time.time", return_value=now), self.assertLogs(level="INFO"):
+                agent.resume_pending()
         self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "cancelled")
         self.api.rows["one"].append(saved_row)
         with patch("time.time", return_value=1300), patch.object(self.api, "append_rows") as append, \
@@ -208,7 +223,7 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(len(self.api.rows["one"]), 4)
 
     def test_create_is_idempotent_after_response_loss_and_preserves_newlines(self):
-        self.api.lose_append_response = True
+        self.api.lose_write_response = True
         fields = {self.config.raw_field: "第一行\n第二行", self.config.title_field: "标题",
                   self.config.requester_field: [{"id": "ou_requester"}], self.config.status_field: "生成中"}
         with self.assertRaisesRegex(FeishuApiError, "响应丢失"):
@@ -221,8 +236,8 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(record.fields[self.config.raw_field], "第一行\n第二行")
         self.assertEqual(record.requester_id, "")
         self.assertEqual(len(self.api.rows["one"][0]), 7)
-        self.assertEqual(len(self.api.rows["one"][-1]), 6)
-        self.assertEqual(self.api.rows["one"][-1][3], "")
+        self.assertEqual(len(self.api.rows["one"][-1]), 5)
+        self.assertIsNone(self.api.rows["one"][-1][3])
 
     def test_requirement_numbers_follow_maximum_and_do_not_add_internal_columns(self):
         self.api.rows["one"][1][0] = 119
@@ -234,21 +249,21 @@ class SourceTests(unittest.TestCase):
         self.assertEqual(self.api.rows["one"][-2][0], 120)
         self.assertEqual(self.api.rows["one"][-1][0], 121)
         self.assertEqual(self.api.rows["one"][0], headers)
-        self.assertEqual(len(self.api.rows["one"][-1]), 6)
+        self.assertEqual(len(self.api.rows["one"][-1]), 5)
 
-    def test_uncertain_missing_append_is_not_replayed_after_restart(self):
+    def test_uncertain_missing_write_is_not_replayed_after_restart(self):
         fields = {self.config.raw_field: "新需求"}
-        with patch.object(self.api, "append_rows", side_effect=FeishuApiError("网络中断")):
+        with patch.object(self.api, "write_ranges", side_effect=FeishuApiError("网络中断")):
             with self.assertRaisesRegex(FeishuApiError, "网络中断"):
                 self.gateway.create_record(fields, client_token="uncertain")
         restarted = SheetGateway(self.config, self.api.refs[0], feishu=self.api)
-        with patch.object(self.api, "append_rows") as append, self.assertRaises(FeishuRecordNotFoundError):
+        with patch.object(self.api, "write_ranges") as write, self.assertRaises(FeishuRecordNotFoundError):
             restarted.create_record(fields, client_token="uncertain")
-        append.assert_not_called()
+        write.assert_not_called()
         self.assertEqual(len(self.api.rows["one"]), 3)
 
-    def test_uncertain_append_cannot_claim_a_different_manual_requirement(self):
-        self.api.lose_append_response = True
+    def test_uncertain_write_cannot_claim_a_different_manual_requirement(self):
+        self.api.lose_write_response = True
         fields = {self.config.raw_field: "原需求"}
         with self.assertRaises(FeishuApiError):
             self.gateway.create_record(fields, client_token="uncertain")
@@ -269,22 +284,133 @@ class SourceTests(unittest.TestCase):
         other = SheetGateway(self.config, self.api.refs[1], feishu=self.api)
         self.assertEqual(other.create_record(fields, client_token="same"), "3")
 
-    def test_manual_number_claimed_before_append_is_not_overwritten(self):
+    def test_manual_number_claimed_before_write_automatically_uses_next_number(self):
         original = self.api.read_range
         reads = 0
 
-        def read(token: str, range_name: str) -> list[list[Any]]:
+        def read(token: str, range_name: str, **kwargs: Any) -> list[list[Any]]:
             nonlocal reads
             reads += 1
-            if reads == 2:
+            if reads == 4:
                 self.api.rows["one"].append([3, "", "待修改", "", "人工新增需求", ""])
-            return original(token, range_name)
+            return original(token, range_name, **kwargs)
 
-        with patch.object(self.api, "read_range", side_effect=read), \
-             patch.object(self.api, "append_rows") as append, self.assertRaisesRegex(FeishuApiError, "已被占用"):
-            self.gateway.create_record({self.config.raw_field: "聊天需求"}, client_token="collision")
-        append.assert_not_called()
-        self.assertEqual(self.api.rows["one"][-1][4], "人工新增需求")
+        with patch.object(self.api, "read_range", side_effect=read):
+            record_id = self.gateway.create_record({self.config.raw_field: "聊天需求"}, client_token="collision")
+        self.assertEqual(record_id, "4")
+        self.assertEqual(self.api.rows["one"][-2][4], "人工新增需求")
+        self.assertEqual(self.api.rows["one"][-1][4], "聊天需求")
+
+    def test_first_completely_empty_row_is_used_without_touching_dropdown_blanks(self):
+        self.api.rows["one"].insert(2, [None] * 8)
+        before = copy.deepcopy(self.api.rows["one"])
+        with patch.object(self.api, "append_rows") as append:
+            self.assertEqual(self.gateway.create_record({self.config.raw_field: "新需求"}), "3")
+            append.assert_not_called()
+        self.assertEqual(len(self.api.rows["one"]), len(before))
+        self.assertEqual(self.api.rows["one"][3], before[3])
+        self.assertEqual(self.api.rows["one"][2], [3, None, "待修改", None, "新需求", None, None, None])
+        self.assertEqual({name for _, name, _ in self.api.writes}, {"one!A3:A3", "one!C3:C3", "one!E3:E3"})
+
+    def test_partial_rows_notes_and_invisible_formulas_are_not_vacancies(self):
+        protected = [[None, "正在选版本"], [None] * 7 + ["无表头的内容"],
+                     [None] * 5 + ["备注"], [None] * 4 + ['=""']]
+        self.api.rows["one"].extend(copy.deepcopy(protected) + [[None] * 7])
+        original = self.api.read_range
+
+        def read(token: str, range_name: str, **kwargs: Any) -> list[list[Any]]:
+            rows = original(token, range_name, **kwargs)
+            if kwargs.get("value_render_option") != "Formula":
+                rows[6][4] = ""  # Formula evaluates to an empty display value.
+            return rows
+
+        with patch.object(self.api, "read_range", side_effect=read):
+            self.gateway.create_record({self.config.raw_field: "新需求"})
+        self.assertEqual(self.api.rows["one"][3:7], protected)
+        self.assertEqual(self.api.rows["one"][7][4], "新需求")
+
+    def test_human_partial_write_to_selected_vacancy_causes_reselection(self):
+        self.api.rows["one"].extend([[None] * 7, [None] * 7])
+        original = self.api.read_range
+        reads = 0
+
+        def read(token: str, range_name: str, **kwargs: Any) -> list[list[Any]]:
+            nonlocal reads
+            reads += 1
+            if reads == 4:
+                self.api.rows["one"][3][5] = "同事正在填写"
+            return original(token, range_name, **kwargs)
+
+        with patch.object(self.api, "read_range", side_effect=read):
+            self.assertEqual(self.gateway.create_record({self.config.raw_field: "聊天需求"}), "3")
+        self.assertEqual(self.api.rows["one"][3], [None] * 5 + ["同事正在填写", None])
+        self.assertEqual(self.api.rows["one"][4][4], "聊天需求")
+
+    def test_dropdown_is_validated_at_the_selected_vacancy_not_at_table_end(self):
+        self.api.rows["one"].insert(2, [None] * 7)
+
+        def rules(token: str, range_name: str) -> list[dict[str, Any]]:
+            if range_name == "one!C3:C3":
+                return [{"conditionValues": ["待处理", "已完成"]}]
+            return []
+
+        with patch.object(self.api, "read_dropdowns", side_effect=rules) as read:
+            self.gateway.create_record({self.config.raw_field: "聊天需求"})
+        self.assertEqual(self.api.rows["one"][2][2], "待处理")
+        self.assertEqual({call.args[1] for call in read.call_args_list}, {"one!B3:B3", "one!C3:C3", "one!D3:D3"})
+
+    def test_full_grid_appends_without_empty_string_dropdown_values(self):
+        gateway = SheetGateway(self.config, replace(self.api.refs[0], row_count=3), feishu=self.api)
+        gateway.create_record({self.config.raw_field: "新需求"})
+        self.assertEqual(self.api.rows["one"][-1], [3, None, "待修改", None, "新需求", None])
+        self.assertEqual(self.api.writes, [])
+
+    def test_temporarily_missing_record_recovers_and_resets_confirmation(self):
+        workspace = SpeakerWorkspace(self.config, feishu=self.api)
+        agent = workspace.agents[self.api.refs[0].key]
+        agent.enqueue_record("1")
+        agent.process_item(required(agent._next_item()))
+        job = required(agent.workflows.latest_job("1"))
+        saved = self.api.rows["one"].pop(1)
+        for now in (1000, 1300):
+            with patch("time.time", return_value=now), self.assertLogs(level="WARNING"):
+                agent.resume_pending()
+        self.api.rows["one"].insert(1, saved)
+        with patch("time.time", return_value=1600):
+            agent.resume_pending()
+        self.assertEqual(required(agent.workflows.latest_job("1"))["id"], job["id"])
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "waiting")
+        self.api.rows["one"].pop(1)
+        with patch("time.time", return_value=1900), self.assertLogs(level="WARNING"):
+            agent.resume_pending()
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "waiting")
+        self.assertEqual(self.api.writes, [])
+
+    def test_duplicate_missing_checks_are_spaced_and_durable(self):
+        agent = DemandAgent(self.config, self.gateway)
+        with patch("time.time", return_value=1000):
+            self.assertFalse(agent.workflows.confirm_missing("1"))
+            self.assertFalse(agent.workflows.confirm_missing("1"))
+        restarted = DemandAgent(self.config, self.gateway)
+        with patch("time.time", return_value=1299):
+            self.assertFalse(restarted.workflows.confirm_missing("1"))
+        with patch("time.time", return_value=1300):
+            self.assertFalse(restarted.workflows.confirm_missing("1"))
+        with patch("time.time", return_value=1600):
+            self.assertTrue(restarted.workflows.confirm_missing("1"))
+
+    def test_network_errors_never_count_as_confirmed_record_absence(self):
+        agent = DemandAgent(self.config, self.gateway)
+        agent.enqueue_record("1")
+        agent.process_item(required(agent._next_item()))
+        job = required(agent.workflows.latest_job("1"))
+        with patch.object(self.gateway, "get_record", side_effect=FeishuApiError("网络故障")):
+            for now in (1000, 1300, 1600):
+                with patch("time.time", return_value=now), self.assertLogs(level="ERROR"):
+                    agent.resume_pending()
+        self.assertEqual(required(agent.workflows.get_job(job["id"]))["state"], "waiting")
+        with patch("time.time", return_value=1900):
+            self.assertFalse(agent.workflows.confirm_missing("1"))
 
     def test_historical_duplicate_ids_do_not_block_unique_records_or_chat_creation(self):
         original = copy.deepcopy(self.api.rows["one"][2])
@@ -352,7 +478,8 @@ class SourceTests(unittest.TestCase):
         self.gateway.update_status(record_id, "生成中", error="等待下层结果")
         self.assertEqual(self.api.rows["one"][0], headers)
         self.assertEqual(self.api.rows["one"][-1], [int(record_id), "1.5.1", "待修改", "龚柏荣", "缓存冷却改为15s", "仅缓存"])
-        self.assertEqual(self.api.writes, [])
+        self.assertEqual(len(self.api.writes), 6)
+        self.api.writes.clear()
         self.gateway.write_result(record_id, "下层结果")
         self.gateway.write_result(record_id, "下层结果")
         self.assertEqual(self.api.rows["one"][-1][6], "下层结果")
@@ -365,7 +492,7 @@ class SourceTests(unittest.TestCase):
         self.gateway.create_record({self.config.raw_field: "新需求"}, client_token="six")
         self.gateway.update_status("1", "生成中", error="等待")
         self.assertEqual(len(self.api.rows["one"][0]), 6)
-        self.assertEqual(self.api.writes, [])
+        self.assertEqual({name for _, name, _ in self.api.writes}, {"one!A4:A4", "one!C4:C4", "one!E4:E4"})
         self.gateway.write_result("1", "下层结论")
         self.assertEqual(self.api.rows["one"][0], ["ID", "版本", "状态", "责任人", "描述", "备注", "处理备注"])
         self.assertEqual(self.api.rows["one"][1][6], "下层结论")
@@ -377,8 +504,8 @@ class SourceTests(unittest.TestCase):
                 self.gateway.create_record({self.config.raw_field: "需求", **invalid})
         self.assertEqual(len(self.api.rows["one"]), 3)
         self.gateway.create_record({self.config.raw_field: "新需求"}, client_token="leaf")
-        self.assertEqual(self.api.rows["one"][-1][1:4], ["", "待处理", ""])
-        self.assertEqual(self.api.writes, [])
+        self.assertEqual(self.api.rows["one"][-1][1:4], [None, "待处理", None])
+        self.assertEqual({name for _, name, _ in self.api.writes}, {"one!A4:A4", "one!C4:C4", "one!E4:E4"})
 
     def test_completed_sheet_analysis_is_not_recreated_while_development_is_pending(self):
         self.api.rows["one"][1][2] = "待修改"
@@ -486,6 +613,8 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(api.read_range("book", "one!A1:G20"), [["第一行\n第二行"]])
         request = sdk.request.call_args.args[0]
         self.assertTrue(unquote(request.uri).endswith("/values/one!A1:G20"))
+        api.read_range("book", "one", value_render_option="Formula")
+        self.assertIn(("valueRenderOption", "Formula"), sdk.request.call_args.args[0].queries)
         api.write_ranges("book", [("one!C2", [["生成中"]])])
         self.assertEqual(sdk.request.call_args.args[0].body["valueRanges"][0]["values"], [["生成中"]])
         api.append_rows("book", "one!A1:G", [["new"]])

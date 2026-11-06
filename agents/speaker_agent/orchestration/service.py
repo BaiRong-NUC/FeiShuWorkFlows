@@ -110,12 +110,15 @@ class DemandAgent:
                 return result
             except Exception as exc:
                 if (isinstance(exc, FeishuRecordNotFoundError)
-                        and (item.source_message is None or self.workflows.latest_job(exc.record_id) is not None)):
+                        and (item.source_message is None or self.workflows.latest_job(exc.record_id) is not None)
+                        and self.workflows.confirm_missing(exc.record_id)):
                     self._cancel_missing_record(exc)
-                    return ProcessingResult(exc.record_id, False, "原台账记录已移除，旧任务已取消", error=str(exc))
+                    return ProcessingResult(exc.record_id, False, "多次复查仍找不到记录，旧任务已取消", error=str(exc))
                 # Preserve both inbox work and the created-record mapping for retry.
                 delay = self._retry_delay(exc)
                 self.workflows.defer_work(item.key, delay=delay)
+                if job is None and isinstance(exc, FeishuRecordNotFoundError):
+                    job = self.workflows.latest_job(exc.record_id)
                 if job is not None:
                     self._defer_job(job, exc)
                 self._log_retry(item.key, exc)
@@ -130,7 +133,7 @@ class DemandAgent:
                 try:
                     self._advance(job)
                 except Exception as exc:
-                    if isinstance(exc, FeishuRecordNotFoundError):
+                    if isinstance(exc, FeishuRecordNotFoundError) and self.workflows.confirm_missing(exc.record_id):
                         self._cancel_missing_record(exc)
                         continue
                     self._defer_job(job, exc)
@@ -138,7 +141,7 @@ class DemandAgent:
 
     def _cancel_missing_record(self, error: FeishuRecordNotFoundError) -> None:
         self.workflows.cancel_record(error.record_id, str(error))
-        LOGGER.info("Speaker 原台账记录已移除，旧任务已取消，保留本地历史：%s", error)
+        LOGGER.info("Speaker 连续三次复查仍找不到台账记录（间隔至少 300 秒），旧任务已取消，保留本地历史：%s", error)
 
     @staticmethod
     def _retry_delay(error: Exception) -> int:
@@ -221,6 +224,7 @@ class DemandAgent:
             if cached and cached.get("decision"):
                 draft = self.normalizer.from_decision(IncomingDemand(**cached["source"]), parse_intake_decision(cached["decision"]))
         record = self.gateway.get_record(record_id)
+        self.workflows.record_found(record_id)
         if record.status not in {self.settings.trigger_status, self.settings.processing_status}:
             return None
         # The ledger snapshot is authoritative even for a chat-created demand.
@@ -336,7 +340,7 @@ class DemandAgent:
         brief = RequirementBrief(**job["brief"])
         current = self.workflows.get_job(job["id"])
         if current and current["state"] == "cancelled":
-            return ProcessingResult(brief.record_id, False, "原台账记录已移除，旧任务已取消")
+            return ProcessingResult(brief.record_id, False, "旧任务已取消，保留本地历史")
         if job.get("retry_at", 0) > time.time():
             return ProcessingResult(brief.record_id, False, "任务已保留，等待重试")
         job.pop("retry_at", None)
@@ -389,6 +393,7 @@ class DemandAgent:
         record_id = job["brief"]["record_id"]
         latest = self.workflows.latest_job(record_id)
         record = self.gateway.get_record(record_id)
+        self.workflows.record_found(record_id)
         allowed = {self.settings.trigger_status, self.settings.processing_status}
         if job["state"] == "publishing":
             allowed.add(self.settings.completed_status)
